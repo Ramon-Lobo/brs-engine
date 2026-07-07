@@ -120,6 +120,25 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
 
     private executeRequest(options: RequestOptions): RoURLEvent {
         const { method, responseType, scope, body, bodyFilePath, onSuccess, errorMessage, logToStdout } = options;
+        // Test-fixture interception: when tmp:/rt-http-fixtures.json maps a substring of the URL to a
+        // canned response, return it instead of performing a real network request. This lets the
+        // headless lane unit-test Tasks and the cbs/webClient API layer with deterministic data.
+        const fixture = this.lookupHttpFixture();
+        if (fixture === "miss") {
+            // Fixtures are active but none matched this URL. Fail fast instead of performing a real
+            // request, which would block/hang headless (no network in CI). Log the URL so the test
+            // author knows which fixture to add.
+            if (BrsDevice.isDevMode) {
+                BrsDevice.stderr.write(
+                    `warning,[rt-fixture] no HTTP fixture matched ${this.url}; returning failure. Add it to tmp:/rt-http-fixtures.json\n`
+                );
+            }
+            return new RoURLEvent(this.identity, this.host, "", 0, "No matching HTTP fixture", "");
+        }
+        if (fixture) {
+            const ok = fixture.code >= 200 && fixture.code < 300;
+            return new RoURLEvent(this.identity, this.host, fixture.body, fixture.code, ok ? "OK" : "Mocked", "");
+        }
         let status = -1;
         let headers = "";
         let responseText = "";
@@ -161,6 +180,34 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
             }
         }
         return new RoURLEvent(this.identity, this.host, responseText, status, this.failureReason, headers);
+    }
+
+    // Reads tmp:/rt-http-fixtures.json (a JSON object mapping a URL substring to either a response
+    // body string or { code, body }). Returns the first fixture whose key is contained in the URL,
+    // or undefined to fall through to a real request. Test-only; the file only exists during tests.
+    private lookupHttpFixture(): { code: number; body: string } | "miss" | undefined {
+        const path = "tmp:/rt-http-fixtures.json";
+        try {
+            if (!this.fs.existsSync(path)) {
+                return undefined; // no fixtures active → perform the real request (default behavior)
+            }
+            const map = JSON.parse(this.fs.readFileSync(path).toString());
+            for (const key of Object.keys(map)) {
+                if (key.length > 0 && this.url.indexOf(key) >= 0) {
+                    const v = map[key];
+                    if (typeof v === "string") {
+                        return { code: 200, body: v };
+                    }
+                    return { code: typeof v.code === "number" ? v.code : 200, body: typeof v.body === "string" ? v.body : "" };
+                }
+            }
+            // Fixtures file present but no key matched — the test is in mock mode; signal a miss so
+            // the caller fails fast rather than hanging on a real request.
+            return "miss";
+        } catch (e) {
+            // Malformed/unreadable fixtures file — ignore and perform the real request.
+        }
+        return undefined;
     }
 
     getConnection(methodParam: string, typeParam: XMLHttpRequestResponseType) {
