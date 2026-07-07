@@ -26,11 +26,31 @@ export class RoRegex extends BrsComponent implements BrsValue {
                     : RuntimeErrorDetail.TypeMismatch;
             throw new RuntimeError(errorDetail);
         }
-        this.jsRegex = new RegExp(expression.getValue(), this.parseFlags(flags.getValue()));
+        this.jsRegex = new RegExp(this.translateRokuRegex(expression.getValue()), this.parseFlags(flags.getValue()));
 
         this.registerMethods({
             ifRegex: [this.isMatch, this.match, this.replace, this.replaceAll, this.split, this.matchAll],
         });
+    }
+
+    /**
+     * Translates PCRE/Roku regex constructs that Roku's (PCRE-based) engine accepts but JavaScript's
+     * RegExp rejects, so a pattern compiles headless the same way it runs on device. Only touches
+     * genuinely PCRE-only syntax — valid JS constructs (named groups (?<name>), lookbehind (?<= (?<!,
+     * lookahead (?= (?!, non-capturing (?:) are left untouched.
+     * @param pattern Roku regex source
+     * @returns JavaScript-compatible regex source
+     */
+    private translateRokuRegex(pattern: string): string {
+        return (
+            pattern
+                // Inline flag modifiers: (?flags) / (?-flags) / (?flags-flags) -> dropped (JS applies flags
+                // globally, so an inline group is a no-op there); (?flags:...) / (?-flags:...) -> (?:...)
+                // The flag class [imsxU-] never matches ':' '=' '!' '<', so (?: (?= (?! (?<... are safe.
+                .replace(/\(\?[imsxU]*-?[imsxU]*([:)])/g, (_m, close) => (close === ":" ? "(?:" : ""))
+                // Atomic groups (?>...) -> non-capturing (JS has no atomic groups)
+                .replace(/\(\?>/g, "(?:")
+        );
     }
 
     toString(parent?: BrsType) {
