@@ -35,7 +35,7 @@ import { sgRoot } from "../SGRoot";
  * @param {WeakSet<Node>} visitedNodes Optional set to track visited nodes for circular reference detection.
  * @return {any} The JavaScript representation of `x`.
  */
-export function jsValueOf(value: BrsType, deep: boolean = true, host?: Node, visitedNodes?: WeakSet<Node>): any {
+export function jsValueOf(value: BrsType, deep: boolean = true, host?: Node, visitedNodes?: WeakSet<object>): any {
     if (value?.kind === undefined) {
         return undefined;
     } else if (isUnboxable(value)) {
@@ -125,8 +125,17 @@ export function fromAssociativeArray(
     aa: RoAssociativeArray,
     deep: boolean = true,
     host?: Node,
-    visitedNodes?: WeakSet<Node>
+    visitedNodes?: WeakSet<object>
 ): FlexObject {
+    // Guard against cyclic associative arrays (an AA that transitively contains itself). Without
+    // this, jsValueOf <-> fromAssociativeArray recurses until the JS stack overflows ("Maximum call
+    // stack size exceeded"). fromSGNode already guards node cycles with the same visited set; share
+    // it so AA<->node cycles are covered too.
+    visitedNodes ??= new WeakSet<object>();
+    if (visitedNodes.has(aa)) {
+        return { _circular_: "roAssociativeArray" };
+    }
+    visitedNodes.add(aa);
     const result: FlexObject = {};
     for (const [key, value] of aa.elements) {
         result[key] = jsValueOf(value, deep, host, visitedNodes);
@@ -446,8 +455,8 @@ export function updateSGNode(obj: any, targetNode: Node, nodeMap?: Map<string, N
  * @param visited Optional WeakSet to track visited nodes and prevent circular references.
  * @returns A JavaScript object with the converted fields.
  */
-export function fromSGNode(node: Node, deep: boolean = true, host?: Node, visited?: WeakSet<Node>): FlexObject {
-    visited ??= new WeakSet<Node>();
+export function fromSGNode(node: Node, deep: boolean = true, host?: Node, visited?: WeakSet<object>): FlexObject {
+    visited ??= new WeakSet<object>();
     if (visited.has(node)) {
         return {
             _circular_: `${node.nodeType}:${node.nodeSubtype}`,
