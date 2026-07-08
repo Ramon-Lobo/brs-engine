@@ -1263,7 +1263,8 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
 
     visitAtSignGet(expression: Expr.AtSignGet) {
         let source = this.evaluate(expression.obj);
-        if (source instanceof BrsInvalid && expression.optional) {
+        // Match the other optional operators: short-circuit on invalid, including boxed roInvalid.
+        if (BrsInvalid.Instance.equalTo(source).toBoolean() && expression.optional) {
             return source;
         }
         if (source instanceof RoXMLElement || source instanceof RoXMLList) {
@@ -1354,7 +1355,10 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
     visitIndexedGet(expression: Expr.IndexedGet): BrsType {
         let source = this.evaluate(expression.obj);
         if (!isCollection(source)) {
-            if (source instanceof BrsInvalid && expression.optional) {
+            // Optional chaining short-circuits when the source is invalid — including the boxed
+            // roInvalid (kind Object), which `instanceof BrsInvalid` misses. Use equalTo to match
+            // visitDottedGet and the optional-call path, so `a?[k]` behaves like `a?.k` on invalid.
+            if (BrsInvalid.Instance.equalTo(source).toBoolean() && expression.optional) {
                 return source;
             }
             this.addError(new RuntimeError(RuntimeErrorDetail.UndimmedArray, expression.location));
