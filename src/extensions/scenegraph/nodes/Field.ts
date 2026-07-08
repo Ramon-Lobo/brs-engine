@@ -414,7 +414,15 @@ export class Field {
                 rectObject.height = rectValue.height;
             }
         }
-        return toAssociativeArray(rectObject);
+        // The device always stores rect2d components as Float (like vector2d), regardless of
+        // whether the source values were integers. Box them explicitly so reads round-trip as
+        // Float rather than Int32 (which toAssociativeArray would infer from integer-valued numbers).
+        return new RoAssociativeArray([
+            { name: new BrsString("x"), value: new Float(rectObject.x) },
+            { name: new BrsString("y"), value: new Float(rectObject.y) },
+            { name: new BrsString("width"), value: new Float(rectObject.width) },
+            { name: new BrsString("height"), value: new Float(rectObject.height) },
+        ]);
     }
 
     private convertVector2D(value: BrsType): RoArray {
