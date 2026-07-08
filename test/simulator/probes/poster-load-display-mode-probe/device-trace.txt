@@ -1,0 +1,3 @@
+loadDisplayMode|scaletofit
+loadDisplayMode_limitSize|limitsize
+done
