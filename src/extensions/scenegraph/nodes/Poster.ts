@@ -78,6 +78,14 @@ export class Poster extends Group {
                 const margins = { left: 0, right: 0, top: 0, bottom: 0 };
                 super.setValue("bitmapMargins", brsValueOf(margins));
             }
+        } else if (fieldName === "loaddisplaymode") {
+            // The device normalizes the loadDisplayMode enum to lowercase on read (e.g. a
+            // "scaleToFit" set in XML reads back as "scaletofit"). Match that so the stored value
+            // round-trips identically headless and on device.
+            const mode = jsValueOf(value);
+            if (typeof mode === "string") {
+                value = new BrsString(mode.toLowerCase());
+            }
         }
         super.setValue(index, value, alwaysNotify, kind);
     }
