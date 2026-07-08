@@ -178,6 +178,10 @@ export class Field {
         const fieldIsObject = getValueKindFromFieldType(this.type) === ValueKind.Object;
         if (
             (fieldIsObject && isInvalid(value)) ||
+            // Assigning invalid to a scalar field (string/number/boolean) is accepted and coerced to
+            // the type's default in convertValue — matching the device, which turns e.g. a string
+            // field into "" rather than leaving the previous value (as rejecting the set would).
+            (!fieldIsObject && isInvalid(value)) ||
             (isAnyNumber(this.value) && isAnyNumber(value)) ||
             (isBrsString(this.value) && isBrsString(value)) ||
             (isBrsString(this.value) && isAnyNumber(value)) ||
@@ -328,6 +332,19 @@ export class Field {
             value = new BrsString(value.toBoolean() ? "1" : "0");
         } else if (isInvalid(value) && this.type === FieldKind.StringArray) {
             value = new RoArray([]);
+        } else if (isInvalid(value) && this.type === FieldKind.String) {
+            // Device coerces invalid -> the type default for scalar fields (not a no-op).
+            value = new BrsString("");
+        } else if (isInvalid(value) && this.type === FieldKind.Int32) {
+            value = new Int32(0);
+        } else if (isInvalid(value) && this.type === FieldKind.Int64) {
+            value = new Int64(0);
+        } else if (isInvalid(value) && this.type === FieldKind.Float) {
+            value = new Float(0);
+        } else if (isInvalid(value) && this.type === FieldKind.Double) {
+            value = new Double(0);
+        } else if (isInvalid(value) && this.type === FieldKind.Boolean) {
+            value = BrsBoolean.False;
         } else if (isBrsString(value) && this.type === FieldKind.Boolean) {
             value = BrsBoolean.from(value.getValue().toLowerCase() === "true");
         } else if (isBrsBoolean(value) && this.type === FieldKind.BoolArray) {
