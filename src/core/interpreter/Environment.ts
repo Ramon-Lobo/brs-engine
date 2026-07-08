@@ -262,4 +262,24 @@ export class Environment {
         }
         return newEnvironment;
     }
+
+    /**
+     * Copies another environment's module-scoped functions into this environment's module scope
+     * (existing entries are kept — the first level to define a name wins). Used when initializing a
+     * SceneGraph component whose type extends other custom components: brs-engine has no closures,
+     * so each inheritance level's init() resolves module functions via the calling environment, and
+     * the environment must therefore expose every level's compiled-together functions (e.g. per-file
+     * coverage RBS_CC_* helpers) — not just the most-derived component's.
+     */
+    public mergeModuleScope(other: Environment): void {
+        for (const [name, value] of other.module) {
+            if (!this.module.has(name)) {
+                this.module.set(name, value);
+                const loc = other.locations.get(name);
+                if (loc) {
+                    this.locations.set(name, loc);
+                }
+            }
+        }
+    }
 }
