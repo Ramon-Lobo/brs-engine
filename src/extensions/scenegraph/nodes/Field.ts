@@ -429,7 +429,9 @@ export class Field {
         const vectorArray: number[] = [];
         if (value instanceof RoArray) {
             if (value.elements.length === 2 && value.elements.every((item: any) => isAnyNumber(item))) {
-                return value;
+                // The device always stores vector2d components as Float. Re-box the elements so an
+                // integer-valued input (e.g. [80, 0]) round-trips as Float rather than Int32.
+                return new RoArray(value.elements.map((item) => new Float((item as BrsNumber).getValue()).box()));
             }
         } else if (value instanceof RoAssociativeArray) {
             const vecValue = fromAssociativeArray(value);
