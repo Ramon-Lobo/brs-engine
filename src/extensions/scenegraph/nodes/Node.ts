@@ -1338,8 +1338,13 @@ export class Node extends RoSGNode implements BrsValue {
      */
     appendChildToParent(child: BrsType): boolean {
         if (child instanceof Node) {
-            if (this.children.includes(child)) {
-                return true;
+            const existingIndex = this.children.indexOf(child);
+            if (existingIndex >= 0) {
+                // Re-appending a child that is already present moves it to the end (z-order to
+                // front), matching the device — it is not a no-op. Widgets rely on this (e.g. a
+                // cross-fade poster re-appends the freshly-loaded child so it renders on top).
+                this.children.splice(existingIndex, 1);
+                this.recordChildChange("remove", existingIndex);
             }
             const insertionIndex = this.children.length;
             this.children.push(child);
