@@ -30,6 +30,7 @@ import {
     RuntimeError,
     BrsError,
     SyncType,
+    Environment,
 } from "brs-engine";
 import {
     FieldAlias,
@@ -76,6 +77,7 @@ export class Node extends RoSGNode implements BrsValue {
     protected readonly aliases: Map<string, FieldAlias>;
     /** Component definition metadata used for field and function resolution. */
     protected readonly componentDef?: ComponentDefinition;
+    private execEnv?: Environment;
     /** Set of function names defined on this component for quick lookup. */
     protected readonly funcNames: Set<string> = new Set();
     /** Ordered list of child nodes retained as BrightScript values. */
@@ -1486,6 +1488,35 @@ export class Node extends RoSGNode implements BrsValue {
      * @param functionArgs Arguments provided by BrightScript.
      * @returns Function return value or invalid when not callable.
      */
+    /**
+     * Environment used to run this node's script functions. brs-engine has no closures, so a called
+     * function resolves module-scope (named) functions via the calling environment. When this node's
+     * type extends other CUSTOM components, the interface (funcNames) inherits the base's public
+     * functions, but each component's own `environment` holds only its own files' functions — so a
+     * base-defined interface function (e.g. one called via callFunc) is otherwise "non-implemented".
+     * Build (and cache) a fresh module scope that is the union of every inheritance level's functions
+     * (most-derived first, so it wins on any name clash), matching initializeNode's exec environment.
+     */
+    protected execEnvironment(): Environment | undefined {
+        if (this.execEnv) {
+            return this.execEnv;
+        }
+        const own = this.componentDef?.environment;
+        if (!own) {
+            return undefined;
+        }
+        const env = own.createSubEnvironment(/* includeModuleScope */ false);
+        let def: ComponentDefinition | undefined = this.componentDef;
+        while (def) {
+            if (def.environment) {
+                env.mergeModuleScope(def.environment);
+            }
+            def = def.extends ? sgRoot.nodeDefMap.get(def.extends.toLowerCase()) : undefined;
+        }
+        this.execEnv = env;
+        return env;
+    }
+
     protected callFunction(interpreter: Interpreter, functionName: BrsString, ...functionArgs: BrsType[]): BrsType {
         // We need to search the callee's environment for this function rather than the caller's.
         // Only allow public functions (defined in the interface) to be called.
@@ -1544,7 +1575,7 @@ export class Node extends RoSGNode implements BrsValue {
                     }
                     return reason.value ?? BrsInvalid.Instance;
                 }
-            }, this.componentDef.environment);
+            }, this.execEnvironment() ?? this.componentDef.environment);
         }
 
         BrsDevice.stderr.write(
