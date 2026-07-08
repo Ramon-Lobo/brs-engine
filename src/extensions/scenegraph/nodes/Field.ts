@@ -349,6 +349,14 @@ export class Field {
             value = BrsBoolean.from(value.getValue().toLowerCase() === "true");
         } else if (isBrsBoolean(value) && this.type === FieldKind.BoolArray) {
             value = new RoArray([value]);
+        } else if (
+            value instanceof RoArray &&
+            (this.type === FieldKind.FloatArray ||
+                this.type === FieldKind.IntArray ||
+                this.type === FieldKind.ColorArray ||
+                this.type === FieldKind.TimeArray)
+        ) {
+            value = this.convertNumericArray(value);
         } else if (this.type === FieldKind.Rect2D) {
             value = this.convertRect2D(value);
         } else if (this.type === FieldKind.Vector2D) {
@@ -384,6 +392,26 @@ export class Field {
             newValue = new RoArray([new Double(value.getValue()).box()]);
         }
         return newValue;
+    }
+
+    // Coerce each element of an array-typed field to the device element type: FloatArray -> Float,
+    // TimeArray -> Double, Int/ColorArray -> Int32. Without this an integer-valued input array (e.g.
+    // itemSpacings = [12, 6, -16]) keeps Int32 elements, diverging from the device where the elements
+    // read back as Float. Non-numeric elements are left untouched.
+    private convertNumericArray(value: RoArray): RoArray {
+        const elements = value.elements.map((el) => {
+            if (!isAnyNumber(el)) {
+                return el;
+            }
+            const raw = Number((isBoxedNumber(el) ? el.unbox() : el).getValue());
+            if (this.type === FieldKind.FloatArray) {
+                return new Float(raw).box();
+            } else if (this.type === FieldKind.TimeArray) {
+                return new Double(raw).box();
+            }
+            return new Int32(raw).box();
+        });
+        return new RoArray(elements);
     }
 
     private convertRect2D(value: BrsType): RoAssociativeArray {
