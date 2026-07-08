@@ -805,7 +805,7 @@ function addFields(interpreter: Interpreter, node: Node, typeDef: ComponentDefin
             continue;
         }
         if (fieldValue.alias?.includes(".")) {
-            if (!addAliases(fieldName, fieldValue.alias, node, typeDef)) {
+            if (!addAliases(fieldName, fieldValue.alias, node, typeDef, fieldValue.value)) {
                 return;
             }
         } else {
@@ -852,7 +852,7 @@ function addFields(interpreter: Interpreter, node: Node, typeDef: ComponentDefin
  * @param typeDef The component definition containing field specifications.
  * @returns True if aliases were successfully added, false otherwise.
  */
-function addAliases(fieldName: string, fieldAlias: string, node: Node, typeDef: ComponentDefinition): boolean {
+function addAliases(fieldName: string, fieldAlias: string, node: Node, typeDef: ComponentDefinition, defaultValue?: string): boolean {
     // Parse comma-separated alias list (e.g., "child1.field1,child2.field2")
     const aliasParts = fieldAlias.split(",").map((s: string) => s.trim());
     const targets: FieldAliasTarget[] = [];
@@ -868,6 +868,13 @@ function addAliases(fieldName: string, fieldAlias: string, node: Node, typeDef: 
                     // Get first child field and type
                     sharedField = field;
                     fieldType = field.getType();
+                    // Propagate the alias field's declared default (e.g. `forceUpperCase` value="true"
+                    // alias="label.forceUpperCase") onto the shared target field, so the default
+                    // reaches the child at construction — matching the device, which forwards the
+                    // default, not only explicit sets.
+                    if (defaultValue !== undefined) {
+                        sharedField.setValue(getBrsValueFromFieldType(fieldType, defaultValue), false);
+                    }
                 } else if (sharedField && field.getType() === fieldType) {
                     // Set siblings with the shared field
                     childNode.getNodeFields().set(childField.toLowerCase(), sharedField);
