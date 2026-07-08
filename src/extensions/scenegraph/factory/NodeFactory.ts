@@ -510,7 +510,20 @@ export function initializeNode(
     if (typeDef) {
         //use typeDef object to tack on all the bells & whistles of a custom node
         const typeDefStack = updateTypeDefHierarchy(typeDef);
-        const currentEnv = typeDef.environment?.createSubEnvironment();
+        // brs-engine has no closures: a called function resolves module-scope functions via the
+        // calling environment. When a component's type extends other CUSTOM components, each
+        // inheritance level's init() runs in this shared env, so it must expose every level's
+        // compiled-together functions (e.g. the per-file coverage RBS_CC_* helpers) — not only the
+        // most-derived component's. Build the env with a fresh module scope that is the union of all
+        // levels, merged most-derived first so it wins on any name clash.
+        const currentEnv = typeDef.environment?.createSubEnvironment(/* includeModuleScope */ false);
+        if (currentEnv) {
+            for (const def of typeDefStack) {
+                if (def.environment) {
+                    currentEnv.mergeModuleScope(def.environment);
+                }
+            }
+        }
 
         // Start from the "basemost" component of the tree.
         typeDef = typeDefStack.pop();
@@ -616,7 +629,20 @@ export function initializeTask(interpreter: Interpreter, taskData: TaskData) {
     if (typeDef) {
         //use typeDef object to tack on all the bells & whistles of a custom node
         const typeDefStack = updateTypeDefHierarchy(typeDef);
-        const currentEnv = typeDef.environment?.createSubEnvironment();
+        // brs-engine has no closures: a called function resolves module-scope functions via the
+        // calling environment. When a component's type extends other CUSTOM components, each
+        // inheritance level's init() runs in this shared env, so it must expose every level's
+        // compiled-together functions (e.g. the per-file coverage RBS_CC_* helpers) — not only the
+        // most-derived component's. Build the env with a fresh module scope that is the union of all
+        // levels, merged most-derived first so it wins on any name clash.
+        const currentEnv = typeDef.environment?.createSubEnvironment(/* includeModuleScope */ false);
+        if (currentEnv) {
+            for (const def of typeDefStack) {
+                if (def.environment) {
+                    currentEnv.mergeModuleScope(def.environment);
+                }
+            }
+        }
 
         // Start from the "basemost" component of the tree.
         typeDef = typeDefStack.pop();
