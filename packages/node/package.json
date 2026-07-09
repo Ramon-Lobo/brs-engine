@@ -1,6 +1,9 @@
 {
-  "name": "brs-node",
+  "name": "@ramon-lobo/brs-node",
   "version": "2.2.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "title": "BrightScript Simulation Engine",
   "description": "BrightScript Simulation Engine - Run Roku apps on Node.js or Terminal (CLI)",
   "author": "Marcelo Lv Cabral <marcelo@lvcabral.com> (https://lvcabral.com/)",
