@@ -60,7 +60,10 @@ module.exports = (env) => {
                 },
             ],
             externals: {
-                "brs-engine": "commonjs brs-node",
+                // The SceneGraph node bundle loads the core engine at runtime via require().
+                // This must match the published package name of packages/node (@ramon-lobo/brs-node),
+                // otherwise `require('brs-node')` fails once the package is scoped.
+                "brs-engine": "commonjs @ramon-lobo/brs-node",
                 xmldoc: "commonjs xmldoc",
             },
             output: {
