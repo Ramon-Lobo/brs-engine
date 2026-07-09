@@ -1,4 +1,4 @@
-const brs = require("brs-node/bin/brs.node");
+const brs = require("@ramonlobo/brs-node/bin/brs.node");
 const {
     Callable,
     tryCoerce,
