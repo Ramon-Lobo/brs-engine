@@ -1,5 +1,5 @@
 {
-  "name": "@ramon-lobo/brs-node",
+  "name": "@ramonlobo/brs-node",
   "version": "2.2.0",
   "publishConfig": {
     "access": "public"

@@ -47,9 +47,9 @@ export class RoRegex extends BrsComponent implements BrsValue {
                 // Inline flag modifiers: (?flags) / (?-flags) / (?flags-flags) -> dropped (JS applies flags
                 // globally, so an inline group is a no-op there); (?flags:...) / (?-flags:...) -> (?:...)
                 // The flag class [imsxU-] never matches ':' '=' '!' '<', so (?: (?= (?! (?<... are safe.
-                .replace(/\(\?[imsxU]*-?[imsxU]*([:)])/g, (_m, close) => (close === ":" ? "(?:" : ""))
+                .replaceAll(/\(\?[imsxU]*-?[imsxU]*([:)])/g, (_m, close) => (close === ":" ? "(?:" : ""))
                 // Atomic groups (?>...) -> non-capturing (JS has no atomic groups)
-                .replace(/\(\?>/g, "(?:")
+                .replaceAll("(?>", "(?:")
         );
     }
 

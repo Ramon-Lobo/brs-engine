@@ -193,12 +193,15 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
             }
             const map = JSON.parse(this.fs.readFileSync(path).toString());
             for (const key of Object.keys(map)) {
-                if (key.length > 0 && this.url.indexOf(key) >= 0) {
+                if (key.length > 0 && this.url.includes(key)) {
                     const v = map[key];
                     if (typeof v === "string") {
                         return { code: 200, body: v };
                     }
-                    return { code: typeof v.code === "number" ? v.code : 200, body: typeof v.body === "string" ? v.body : "" };
+                    return {
+                        code: typeof v.code === "number" ? v.code : 200,
+                        body: typeof v.body === "string" ? v.body : "",
+                    };
                 }
             }
             // Fixtures file present but no key matched — the test is in mock mode; signal a miss so

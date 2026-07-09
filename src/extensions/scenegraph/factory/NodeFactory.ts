@@ -852,7 +852,13 @@ function addFields(interpreter: Interpreter, node: Node, typeDef: ComponentDefin
  * @param typeDef The component definition containing field specifications.
  * @returns True if aliases were successfully added, false otherwise.
  */
-function addAliases(fieldName: string, fieldAlias: string, node: Node, typeDef: ComponentDefinition, defaultValue?: string): boolean {
+function addAliases(
+    fieldName: string,
+    fieldAlias: string,
+    node: Node,
+    typeDef: ComponentDefinition,
+    defaultValue?: string
+): boolean {
     // Parse comma-separated alias list (e.g., "child1.field1,child2.field2")
     const aliasParts = fieldAlias.split(",").map((s: string) => s.trim());
     const targets: FieldAliasTarget[] = [];
