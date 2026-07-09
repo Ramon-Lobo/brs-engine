@@ -1,8 +1,8 @@
 name: publish
 
-# Publishes @ramon-lobo/brs-node (packages/node) to npm. The workspace root stays
+# Publishes @ramonlobo/brs-node (packages/node) to npm. The workspace root stays
 # private and is not published. Requires an NPM_TOKEN repo secret with publish
-# rights to the @ramon-lobo scope.
+# rights to the @ramonlobo scope.
 #
 # Trigger by pushing a tag (v2.2.0, v2.2.1, …) or running the workflow manually.
 on:
@@ -23,7 +23,7 @@ jobs:
       - run: npm install
       # packages/node's prepublishOnly runs `clean && release && build:sg`, so the
       # published bin/ (brs.node.js + brs-sg.node.js) is always freshly built.
-      - name: Publish @ramon-lobo/brs-node
+      - name: Publish @ramonlobo/brs-node
         working-directory: packages/node
         run: npm publish
         env:
