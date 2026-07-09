@@ -399,7 +399,7 @@ export class Field {
     // itemSpacings = [12, 6, -16]) keeps Int32 elements, diverging from the device where the elements
     // read back as Float. Non-numeric elements are left untouched.
     private convertNumericArray(value: RoArray): RoArray {
-        const elements = value.elements.map((el) => {
+        const elements = value.elements.map((el: any) => {
             if (!isAnyNumber(el)) {
                 return el;
             }
@@ -415,7 +415,7 @@ export class Field {
     }
 
     private convertRect2D(value: BrsType): RoAssociativeArray {
-        const rectObject: FlexObject = { x: 0, y: 0, width: 0, height: 0 };
+        const rectObject: { x: number; y: number; width: number; height: number } = { x: 0, y: 0, width: 0, height: 0 };
         if (value instanceof RoArray) {
             const rectArray = jsValueOf(value);
             if (
@@ -459,7 +459,7 @@ export class Field {
             if (value.elements.length === 2 && value.elements.every((item: any) => isAnyNumber(item))) {
                 // The device always stores vector2d components as Float. Re-box the elements so an
                 // integer-valued input (e.g. [80, 0]) round-trips as Float rather than Int32.
-                return new RoArray(value.elements.map((item) => new Float((item as BrsNumber).getValue()).box()));
+                return new RoArray(value.elements.map((item: any) => new Float((item as BrsNumber).getValue()).box()));
             }
         } else if (value instanceof RoAssociativeArray) {
             const vecValue = fromAssociativeArray(value);
