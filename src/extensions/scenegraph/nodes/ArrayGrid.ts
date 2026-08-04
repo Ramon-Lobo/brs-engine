@@ -15,12 +15,13 @@ import {
 import { FieldKind, FieldModel } from "../SGTypes";
 import { Poster, SGNodeType } from ".";
 import { Group } from "./Group";
+import { Node } from "./Node";
+import { Field } from "./Field";
 import { createNode } from "../factory/NodeFactory";
 import { brsValueOf, jsValueOf } from "../factory/Serializer";
 import { sgRoot } from "../SGRoot";
 import { ContentNode } from "./ContentNode";
 import { Font } from "./Font";
-import { rotateTranslation } from "../SGUtil";
 
 export enum FocusStyle {
     FixedFocusWrap = "fixedFocusWrap",
@@ -28,10 +29,31 @@ export enum FocusStyle {
     FixedFocus = "fixedFocus",
 }
 
-const ValidVertStyles = new Set(Object.values(FocusStyle).map((style) => style.toLowerCase()));
-const ValidHorizStyles = new Set(
-    [FocusStyle.FixedFocusWrap, FocusStyle.FloatingFocus].map((style) => style.toLowerCase())
-);
+/**
+ * Resolves a raw focus-animation-style string (either axis: `vertFocusAnimationStyle` or
+ * `horizFocusAnimationStyle`) to a canonical {@link FocusStyle}, or `undefined` when the value is
+ * not recognized. Matching is case-insensitive.
+ *
+ * The abbreviated value `"fixed"` is accepted as an alias for `fixedFocus`: real apps set
+ * `vertFocusAnimationStyle="fixed"` to mean non-wrapping fixed focus, and a device honors that
+ * intent rather than keeping the field's previous (possibly `fixedFocusWrap`) value. Without this,
+ * a grid whose default is `fixedFocusWrap` (MarkupGrid/PosterGrid) would keep wrapping and never let
+ * an Up press at the top row bubble to a parent that moves focus elsewhere. `fixedFocus` is likewise
+ * honored for the horizontal axis even though the reference's option table omits it — a real device
+ * accepts it and pins the focused column at the grid's left edge.
+ */
+export function resolveFocusStyle(raw: string | undefined): FocusStyle | undefined {
+    const value = (raw ?? "").toLowerCase();
+    for (const style of Object.values(FocusStyle)) {
+        if (style.toLowerCase() === value) {
+            return style;
+        }
+    }
+    if (value === "fixed") {
+        return FocusStyle.FixedFocus;
+    }
+    return undefined;
+}
 
 export declare namespace ArrayGrid {
     type Metadata = {
@@ -83,9 +105,18 @@ export class ArrayGrid extends Group {
         { name: "itemUnfocused", type: "integer", value: "-1", alwaysNotify: true },
         { name: "jumpToItem", type: "integer", value: "-1", alwaysNotify: true },
         { name: "animateToItem", type: "integer", value: "-1", alwaysNotify: true },
+        // Read-only on device: true while the list/grid is scrolling the focus. Documented under
+        // ZoomRowList but present on all ArrayGrid-derived nodes on a real Roku (apps alias it on
+        // plain RowList). Pulsed true→false around a key-driven focus move (see armScrollPulse).
+        { name: "scrollingStatus", type: "boolean", value: "false" },
         { name: "currFocusRow", type: "float", value: "0.0" },
         { name: "currFocusColumn", type: "float", value: "0.0" },
         { name: "currFocusSection", type: "float", value: "0.0" },
+        // Read-only on device: the direction ("up"/"down"/"none") of the most recent vertical focus
+        // move. Undocumented in the public reference but present on real Roku ArrayGrid-derived nodes;
+        // apps observe it to track scroll direction (e.g. to position an in-transit overlay toward the
+        // incoming row). Emitted as up/down on a vertical nav then reset to "none".
+        { name: "vertFocusDirection", type: "string", value: "none" },
     ];
     protected readonly dividerUri = "common:/images/dividerHorizontal.9.png";
     protected readonly content: ContentNode[] = [];
@@ -100,11 +131,24 @@ export class ArrayGrid extends Group {
     protected numCols: number = 0;
     protected currRow: number = 0;
     protected topRow: number = 0;
+    // Set when the focus/scroll position changes and cleared once renderNode re-lays-out the grid.
+    // While set, a subBoundingRect query refreshes layout first so it reports the settled focus-band
+    // position instead of the newly focused item's stale, pre-scroll cached rect (see
+    // needsSubBoundingRectRefresh / Node.getSubBoundingRect).
+    protected focusLayoutDirty: boolean = false;
     protected wrap: boolean = false;
     protected lastPressHandled: string;
+    /**
+     * A navigation key is being handled and `scrollingStatus` may still need its rising edge. Armed
+     * by `armScrollPulse`, consumed by the first `emitScrollPulse` (see `armScrollPulse`).
+     */
+    protected scrollPulseArmed: boolean = false;
+    /** The rising edge has been emitted and the falling edge is still owed. */
+    protected scrollPulseActive: boolean = false;
     protected hasNinePatch: boolean;
     protected focusField: string;
-    protected vertFocusAnimationStyleName: string;
+    protected vertFocusAnimationStyleName: string = FocusStyle.FloatingFocus.toLowerCase();
+    protected horizFocusAnimationStyleName: string = FocusStyle.FloatingFocus.toLowerCase();
     public itemFocusCallback?: (index: number) => void;
 
     constructor(initializedFields: AAMember[] = [], readonly name: string = SGNodeType.ArrayGrid) {
@@ -138,9 +182,8 @@ export class ArrayGrid extends Group {
         this.setValueSilent("focusable", BrsBoolean.True);
         this.setValueSilent("wrapDividerBitmapUri", new BrsString(this.dividerUri));
         this.setValueSilent("sectionDividerBitmapUri", new BrsString(this.dividerUri));
-        const style = (this.getValueJS("vertFocusAnimationStyle") as string) ?? FocusStyle.FloatingFocus;
-        this.vertFocusAnimationStyleName = style.toLowerCase();
-        this.wrap = this.vertFocusAnimationStyleName === FocusStyle.FixedFocusWrap.toLowerCase();
+        this.applyVertFocusStyle();
+        this.applyHorizFocusStyle();
         this.lastPressHandled = "";
         this.hasNinePatch = false;
         this.focusField = "listHasFocus";
@@ -152,34 +195,38 @@ export class ArrayGrid extends Group {
             super.setValue(index, value, alwaysNotify, kind);
             this.itemComps.length = 0;
             this.refreshContent();
-            if (this.content.length > 0) {
-                this.setFocusedItem(0);
-            }
+            this.resetFocusForNewContent(true);
             return;
         } else if (["jumptoitem", "animatetoitem"].includes(fieldName) && isNumberComp(value)) {
             this.setFocusedItem(jsValueOf(value));
-        } else if (fieldName === "numrows" && isNumberComp(value)) {
-            this.numRows = jsValueOf(value) as number;
-        } else if (fieldName === "numcolumns" && isNumberComp(value)) {
-            this.numCols = jsValueOf(value) as number;
         } else if (fieldName === "vertfocusanimationstyle" && isBrsString(value)) {
-            const style = value.toString().toLowerCase();
-            if (ValidVertStyles.has(style)) {
-                this.vertFocusAnimationStyleName = style;
-                this.wrap = style === FocusStyle.FixedFocusWrap.toLowerCase();
+            const style = resolveFocusStyle(value.toString());
+            if (style) {
+                this.vertFocusAnimationStyleName = style.toLowerCase();
+                this.wrap = style === FocusStyle.FixedFocusWrap;
             } else {
                 // Invalid vertFocusAnimationStyle
                 return;
             }
-        } else if (
-            fieldName === "horizfocusanimationstyle" &&
-            isBrsString(value) &&
-            !ValidHorizStyles.has(value.toString().toLowerCase())
-        ) {
-            // Invalid horizFocusAnimationStyle
-            return;
+        } else if (fieldName === "horizfocusanimationstyle" && isBrsString(value)) {
+            const style = resolveFocusStyle(value.toString());
+            if (style) {
+                this.horizFocusAnimationStyleName = style.toLowerCase();
+            } else {
+                // Invalid horizFocusAnimationStyle: keep the field's current value (device behavior)
+                return;
+            }
         }
         super.setValue(index, value, alwaysNotify, kind);
+        // Refresh cached row/column counts from the (possibly coerced) field value, so a
+        // numeric string such as "7" from a settings lookup is honored — not just a raw
+        // number. super.setValue coerces the string into the integer field the same way a
+        // Roku device does, making the field the single source of truth.
+        if (fieldName === "numrows") {
+            this.numRows = this.getValueJS("numrows") as number;
+        } else if (fieldName === "numcolumns") {
+            this.numCols = this.getValueJS("numcolumns") as number;
+        }
         const rowFields = ["vertfocusanimationstyle", "numrows", "focusrow"];
         // Update the current row if some fields changed
         if (rowFields.includes(fieldName)) {
@@ -189,27 +236,111 @@ export class ArrayGrid extends Group {
 
     setNodeFocus(focusOn: boolean): boolean {
         const focus = super.setNodeFocus(focusOn);
-        const focusIndex = this.getValueJS("itemFocused") as number;
-        if (focus && focusIndex >= 0) {
-            this.setFocusedItem(focusIndex);
+        if (focus) {
+            let focusIndex = this.getValueJS("itemFocused") as number;
+            if (focusIndex < 0) {
+                // No item has been focused yet: default to the first item (Roku's itemFocused
+                // default is 0). Rebuild the internal content view first so items added in place
+                // (e.g. via ContentNode.update() after the content node was assigned empty) count.
+                this.refreshContent();
+                if (this.content.length > 0) {
+                    focusIndex = 0;
+                }
+            }
+            if (focusIndex >= 0) {
+                this.setFocusedItem(focusIndex);
+            }
         }
         return focus;
     }
 
+    /**
+     * Reconciles the focus cursor after the content view changes (a fresh `content` assignment, or
+     * an in-place populate/mutation detected during render).
+     *
+     * On a real device `itemFocused` only changes when focus moves onto an item — loading content
+     * into a list that is not in the focus chain does NOT fire it (verified on hardware). So:
+     * - If the grid currently has focus and content is non-empty, focus item 0 now (emitting
+     *   `itemFocused`) so a focused list reflects the newly loaded content, matching Roku.
+     * - If the grid is not focused, stay silent: reset the internal cursor and, for a fresh content
+     *   assignment, clear `itemFocused` back to the "never focused" sentinel so a later focus-gain
+     *   (`setNodeFocus`) fires `itemFocused = 0`. A non-fresh in-place change on an unfocused grid
+     *   leaves any established value untouched.
+     *
+     * @param freshContent True when a brand-new `content` node was assigned (vs. an in-place
+     *   populate/mutation of the existing tree). A fresh assignment resets the cursor to item 0.
+     */
+    protected resetFocusForNewContent(freshContent: boolean) {
+        const focused = sgRoot.focused === this || this.isChildrenFocused();
+        if (focused) {
+            if (this.content.length > 0 && (freshContent || (this.getValueJS("itemFocused") as number) < 0)) {
+                this.setFocusedItem(0);
+            }
+            return;
+        }
+        if (freshContent) {
+            // Unfocused, brand-new content: reset the cursor and the sentinel silently (no observer
+            // fire). setNodeFocus will emit itemFocused = 0 when focus later lands on the grid.
+            this.focusIndex = 0;
+            this.focusLayoutDirty = true;
+            this.setValueSilent("itemFocused", new Int32(-1));
+        }
+    }
+
+    /**
+     * Moves the focus cursor to `index`, emitting the focus-move fields (`itemUnfocused`,
+     * `itemFocused`) ONLY when the grid is actually in the focus chain.
+     *
+     * On a real device `itemFocused` changes only when an item gains the key focus — writing
+     * `jumpToItem`/`animateToItem`, assigning `content`, or populating content on a grid that is
+     * NOT in the focus chain does not fire it (verified on hardware). So when the grid is unfocused
+     * this records the target index SILENTLY (no observer notification): the internal cursor and the
+     * `itemFocused` value are updated so the position is remembered, and `setNodeFocus` re-emits
+     * `itemFocused` when focus later lands on the grid. This prevents list-driven side effects (e.g.
+     * an app starting a preview video off an `itemFocused` observer) from triggering while focus is
+     * still elsewhere.
+     */
     protected setFocusedItem(index: number) {
         const newFocus = this.findContentIndex(index);
         if (newFocus === -1) {
             return;
         }
-        const focusedIndex = this.getValueJS("itemFocused") as number;
         const nodeFocus = sgRoot.focused === this;
-        this.updateItemFocus(this.focusIndex, false, nodeFocus);
-        super.setValue("itemUnfocused", new Int32(focusedIndex));
-        this.focusIndex = newFocus;
-        this.updateItemFocus(this.focusIndex, true, nodeFocus);
-        super.setValue("itemFocused", new Int32(index));
-        if (this.itemFocusCallback) {
-            this.itemFocusCallback(index);
+        const inFocusChain = nodeFocus || this.isChildrenFocused();
+        if (inFocusChain) {
+            // Emit the scroll pulse BEFORE the settled focus fields go out: on a device
+            // scrollingStatus falls while the scroll finishes and the focus settles afterward, and
+            // apps depend on that order (the falling edge tears transient scroll state down, the
+            // focus settle rebuilds it at the new position). Deliberately outside the internal-update
+            // bracket below — these notifications must dispatch synchronously here, not defer past
+            // the settle they precede. Skipped when unfocused: that path publishes no focus fields at
+            // all, so a pulse would be a teardown with nothing to rebuild from (see armScrollPulse).
+            this.emitScrollPulse();
+        }
+        // Focus fields are emitted by the grid's internal machinery, not by a direct BrightScript
+        // assignment — on Roku their observers dispatch from the message loop, so a reentrant
+        // notification defers (see Field.enterInternalUpdate).
+        Field.enterInternalUpdate();
+        try {
+            const focusedIndex = this.getValueJS("itemFocused") as number;
+            this.updateItemFocus(this.focusIndex, false, nodeFocus);
+            this.focusIndex = newFocus;
+            this.focusLayoutDirty = true;
+            this.updateHorizScroll(newFocus);
+            this.updateItemFocus(this.focusIndex, true, nodeFocus);
+            if (inFocusChain) {
+                super.setValue("itemUnfocused", new Int32(focusedIndex));
+                super.setValue("itemFocused", new Int32(index));
+            } else {
+                // Unfocused: remember the target without notifying observers. setNodeFocus emits it on
+                // focus-gain (it reads itemFocused, defaulting to 0 when still at the -1 sentinel).
+                this.setValueSilent("itemFocused", new Int32(index));
+            }
+            if (this.itemFocusCallback) {
+                this.itemFocusCallback(index);
+            }
+        } finally {
+            Field.exitInternalUpdate();
         }
     }
 
@@ -222,12 +353,99 @@ export class ArrayGrid extends Group {
         return index;
     }
 
+    /**
+     * Resolves an ifSGNodeBoundingRect sub part identifier to the matching item component:
+     * `itemX` (data-model index X), `itemX_Y` (row X — list nodes hold one component per row),
+     * `focusItem` and `focusIndicator` (the focused item; the indicator hugs the item rect).
+     * Item components are created lazily during rendering, so an off-screen item resolves to
+     * undefined and the caller falls back to the node's own bounding rect (matching Roku's
+     * "if the subpart does not exist" behavior).
+     */
+    protected needsSubBoundingRectRefresh(): boolean {
+        return this.focusLayoutDirty;
+    }
+
+    protected resolveSubpart(itemNumber: string): Node | undefined {
+        const name = itemNumber.trim().toLowerCase();
+        let compIndex = -1;
+        if (name === "focusitem" || name === "focusindicator") {
+            compIndex = this.focusIndex;
+        } else if (name.startsWith("item")) {
+            const contentIndex = Number.parseInt(name.slice(4), 10);
+            if (Number.isInteger(contentIndex)) {
+                compIndex = this.findContentIndex(contentIndex);
+            }
+        }
+        return compIndex >= 0 ? this.itemComps[compIndex] : undefined;
+    }
+
     protected updateItemFocus(index: number, focus: boolean, nodeFocus: boolean) {
         const itemComp = this.itemComps[index];
         if (!itemComp) return;
-        itemComp.setValue("itemHasFocus", BrsBoolean.from(focus), false);
+        // Per the reference, an item only "has focus" when it is the focused cell AND the grid itself
+        // has focus; a defocused grid must report itemHasFocus=false for every item (see RowList).
+        itemComp.setValue("itemHasFocus", BrsBoolean.from(focus && nodeFocus), false);
         itemComp.setValue(this.focusField, BrsBoolean.from(nodeFocus), false);
         itemComp.setValue("focusPercent", new Float(focus ? 1 : 0), false);
+    }
+
+    /**
+     * Arms a `scrollingStatus` pulse for a navigation key, without emitting anything yet.
+     *
+     * `scrollingStatus` reports that the list is scrolling the focus (see zoomrowlist.md — the field
+     * is documented under ZoomRowList but exists on every ArrayGrid-derived node on a device, and
+     * apps alias it from a plain RowList). It was declared here but never emitted, so an observer on
+     * it never fired.
+     *
+     * On a device the scroll spans several frames: the field goes true, the focus fields pass
+     * through in-transit values, and it goes false BEFORE the focus finally settles. Apps rely on
+     * that interleave — the falling edge is where they tear transient scroll state down (hiding a
+     * shared overlay/preview player that belongs to the outgoing item), and the *settle* emission of
+     * the focus fields is what rebuilds it at the new position. Our scroll is instant, so both edges
+     * land in one frame and the ORDER is the whole contract: the falling edge must precede the focus
+     * settle, or the teardown runs last and the app is left with its overlay torn down and nothing
+     * to restore it.
+     *
+     * Hence "armed" rather than "open": the pulse is only *emitted* by `emitScrollPulse`, called
+     * from the focus-settle paths. A key that scrolls nothing — a boundary press on a non-wrapping
+     * list, or any key while the grid is outside the focus chain (both of which publish no focus
+     * fields at all) — must emit NOTHING, exactly as a device does. Pulsing there would hand an app
+     * a teardown edge with no settle behind it to rebuild from, which is the same failure as
+     * emitting the edges in the wrong order.
+     */
+    protected armScrollPulse() {
+        this.scrollPulseArmed = true;
+    }
+
+    /**
+     * Emits the rising edge the first time a focus move is about to publish its settled fields, then
+     * immediately the falling edge — the pair a device produces around an instant scroll. Called by
+     * every settle path right before it emits the focus fields, and idempotent per key press: later
+     * calls within the same press (a move that touches several settle paths) do nothing.
+     */
+    protected emitScrollPulse() {
+        if (!this.scrollPulseArmed) {
+            return;
+        }
+        this.scrollPulseArmed = false;
+        this.scrollPulseActive = true;
+        super.setValue("scrollingStatus", BrsBoolean.True);
+        this.scrollPulseActive = false;
+        super.setValue("scrollingStatus", BrsBoolean.False);
+    }
+
+    /**
+     * Disarms at the end of a key press, and closes the pulse if an exception unwound between the
+     * two edges — the field must never be left stranded at `true`, which would suppress every later
+     * notification (it is not `alwaysNotify`, so a same-value write is silent).
+     */
+    protected endScrollPulse() {
+        this.scrollPulseArmed = false;
+        if (!this.scrollPulseActive) {
+            return;
+        }
+        this.scrollPulseActive = false;
+        super.setValue("scrollingStatus", BrsBoolean.False);
     }
 
     handleKey(key: string, press: boolean): boolean {
@@ -236,17 +454,36 @@ export class ArrayGrid extends Group {
             return true;
         }
         let handled = false;
-        if (key === "up" || key === "down") {
-            handled = press ? this.handleUpDown(key) : false;
-        } else if (key === "left" || key === "right") {
-            handled = press ? this.handleLeftRight(key) : false;
-        } else if (key === "rewind" || key === "fastforward") {
-            handled = press ? this.handlePageUpDown(key) : false;
-        } else if (key === "OK") {
+        if (key === "OK") {
             handled = this.handleOK(press);
+        } else if (press && ["up", "down", "left", "right", "rewind", "fastforward"].includes(key)) {
+            try {
+                // Arm inside the try so an exception from either edge's observers still unwinds
+                // through the finally below and cannot strand the field at true.
+                this.armScrollPulse();
+                if (key === "up" || key === "down") {
+                    handled = this.handleUpDown(key);
+                } else if (key === "left" || key === "right") {
+                    handled = this.handleLeftRight(key);
+                } else {
+                    handled = this.handlePageUpDown(key);
+                }
+            } finally {
+                // Disarm: a key that scrolled nothing emits no pulse at all (see armScrollPulse).
+                this.endScrollPulse();
+            }
         }
         this.lastPressHandled = handled && key !== "OK" ? key : "";
         return handled;
+    }
+
+    /**
+     * Hook invoked by setFocusedItem after the focus cursor moves, so grid types that keep a
+     * horizontal column-scroll window (MarkupGrid) can update it for every focus path — key
+     * navigation, jumpToItem/animateToItem, and focus-gain. No-op for other node types.
+     */
+    protected updateHorizScroll(_index: number) {
+        // Overridden by MarkupGrid to maintain its horizontal column-scroll window.
     }
 
     protected handleUpDown(_key: string) {
@@ -276,7 +513,17 @@ export class ArrayGrid extends Group {
         return new ContentNode();
     }
 
-    protected getContentChildren(content: ContentNode): ContentNode[] {
+    /**
+     * Children of a content row/section, tolerating a missing node. Callers index into `this.content`
+     * (`this.content[row]`), which is empty while the app has not assigned `content` yet or assigned an
+     * empty tree — the focus cursor can still point at row 0, so the lookup yields `undefined`. A real
+     * device simply has nothing to navigate there; returning an empty list lets the caller report the
+     * key as unhandled (so it bubbles to the parent) instead of throwing.
+     */
+    protected getContentChildren(content?: ContentNode): ContentNode[] {
+        if (!(content instanceof ContentNode)) {
+            return [];
+        }
         return content.getNodeChildren().map((child) => {
             if (child instanceof ContentNode) {
                 return child;
@@ -285,15 +532,21 @@ export class ArrayGrid extends Group {
         });
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible()) {
             this.updateRenderTracking(true);
+            if (!draw2D) {
+                this.measureHiddenExtent(origin, angle);
+            }
             return;
         }
-        const nodeTrans = this.getTranslation();
-        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const size = this.getDimensions();
         const rect = { x: drawTrans[0], y: drawTrans[1], ...size };
         const rotation = angle + this.getRotation();
@@ -303,7 +556,10 @@ export class ArrayGrid extends Group {
             this.refreshContent();
             content.changed = false;
         }
+        // The clippingRect bracket lives in the renderNode template, so it wraps this whole body.
         this.renderContent(interpreter, rect, rotation, opacity, draw2D);
+        // The grid was just laid out for the current focus/scroll state, so item rects are fresh.
+        this.focusLayoutDirty = false;
         this.updateBoundingRects(rect, origin, rotation);
         this.renderChildren(interpreter, drawTrans, rotation, opacity, draw2D);
         this.nodeRenderingDone(origin, angle, opacity, draw2D);
@@ -317,6 +573,32 @@ export class ArrayGrid extends Group {
         _draw2D?: IfDraw2D
     ) {
         // To be overwritten by derivate classes
+    }
+
+    /**
+     * Refreshes this grid's bounding rects while it is invisible, for a measurement pass (no draw
+     * target). On Roku, layout and bounding rects are independent of visibility — apps size sibling
+     * UI (e.g. a background poster) from a hidden grid's boundingRect() before revealing it. The
+     * hard skip in renderNode must stay for real draws (a hidden grid must not create item
+     * components or load textures), so the extent is derived arithmetically from the content length,
+     * itemSize and spacing via updateRect — no item components are instantiated. renderNode still
+     * returns before nodeRenderingDone, so the hidden grid does not union into its parent's bounds.
+     */
+    protected measureHiddenExtent(origin: number[], angle: number) {
+        const contentNode = this.getValue("content");
+        if (contentNode instanceof ContentNode && contentNode.changed) {
+            this.refreshContent();
+            contentNode.changed = false;
+        }
+        const itemSize = this.getValueJS("itemSize") as number[];
+        if (this.content.length === 0 || !itemSize?.[0] || !itemSize?.[1] || !this.numRows || !this.numCols) {
+            return;
+        }
+        const drawTrans = this.getDrawTranslation(origin, angle);
+        const rect = { x: drawTrans[0], y: drawTrans[1], ...this.getDimensions() };
+        const displayRows = Math.min(Math.ceil(this.content.length / this.numCols), this.numRows);
+        this.updateRect(rect, displayRows, itemSize, { firstRow: this.topRow });
+        this.updateBoundingRects(rect, origin, angle + this.getRotation());
     }
 
     protected renderItemComponent(
@@ -336,6 +618,15 @@ export class ArrayGrid extends Group {
                 this.itemComps[index] = itemComp;
             }
         }
+        if (!this.itemComps[index]) {
+            // Item component creation failed: skip the slot instead of crashing the render pass.
+            return;
+        }
+        // Re-apply the per-item size every frame. Width/height are otherwise only set at creation
+        // time (createItemComponent); a cached item first created before the grid's real item size
+        // was applied would stay frozen at the wrong (full-width) size — stretching the item.
+        this.itemComps[index].setValue("width", new Float(itemRect.width), false);
+        this.itemComps[index].setValue("height", new Float(itemRect.height), false);
         if (content.changed) {
             this.itemComps[index].setValue("itemContent", content, true);
             content.changed = false;
@@ -347,9 +638,41 @@ export class ArrayGrid extends Group {
             this.renderFocus(itemRect, opacity, nodeFocus, draw2D);
         }
         const itemOrigin = [itemRect.x, itemRect.y];
-        this.itemComps[index].renderNode(interpreter, itemOrigin, rotation, opacity, draw2D);
+        this.renderItemClipped(interpreter, this.itemComps[index], itemOrigin, itemRect, rotation, opacity, draw2D);
         if (focused && drawFocus && drawFocusOnTop) {
             this.renderFocus(itemRect, opacity, nodeFocus, draw2D);
+        }
+    }
+
+    /**
+     * Renders an item component clipped to its cell (`itemRect`, i.e. the grid's `itemSize`), matching
+     * Roku: content an item draws beyond its own width/height is not shown. Apps rely on this to collapse
+     * item content by shrinking `itemSize` — e.g. a vertical button bar whose label is parked just past the
+     * item's right edge so only the icon shows until the bar expands. Clipping only happens on a real draw
+     * pass; a measurement pass (no `draw2D`) must stay unclipped so hidden-UI bounding rects still compute.
+     * The focus feedback is drawn by the caller outside this clip so its indicator can outset the item.
+     */
+    protected renderItemClipped(
+        interpreter: Interpreter,
+        itemComp: Group,
+        itemOrigin: number[],
+        itemRect: Rect,
+        rotation: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
+        if (draw2D) {
+            draw2D.pushClip({ x: itemRect.x, y: itemRect.y, width: itemRect.width, height: itemRect.height });
+        }
+        try {
+            // The item component runs app BrightScript (its init(), field observers); an error
+            // escaping from there must not strand the cell clip on the canvas for the rest of the
+            // frame, which would silently clip everything drawn after it.
+            itemComp.renderNode(interpreter, itemOrigin, rotation, opacity, draw2D);
+        } finally {
+            if (draw2D) {
+                draw2D.popClip();
+            }
         }
     }
 
@@ -516,6 +839,31 @@ export class ArrayGrid extends Group {
         );
     }
 
+    /**
+     * Derives the cached `vertFocusAnimationStyleName` and `wrap` flag from the current
+     * `vertFocusAnimationStyle` field, resolving aliases (e.g. `"fixed"` → `fixedFocus`) and falling
+     * back to `floatingFocus` for unrecognized values. Called from the constructors so the cached
+     * state stays consistent with whatever value XML/initialized fields stored on the node.
+     */
+    protected applyVertFocusStyle() {
+        const style =
+            resolveFocusStyle(this.getValueJS("vertFocusAnimationStyle") as string) ?? FocusStyle.FloatingFocus;
+        this.vertFocusAnimationStyleName = style.toLowerCase();
+        this.wrap = style === FocusStyle.FixedFocusWrap;
+    }
+
+    /**
+     * Derives the cached `horizFocusAnimationStyleName` from the current `horizFocusAnimationStyle`
+     * field, resolving aliases (e.g. `"fixed"` → `fixedFocus`) and falling back to `floatingFocus`
+     * for unrecognized values. Called from the constructors so the cached state stays consistent
+     * with whatever value XML/initialized fields stored on the node.
+     */
+    protected applyHorizFocusStyle() {
+        const style =
+            resolveFocusStyle(this.getValueJS("horizFocusAnimationStyle") as string) ?? FocusStyle.FloatingFocus;
+        this.horizFocusAnimationStyleName = style.toLowerCase();
+    }
+
     protected getRenderRowIndex(rowPosition: number) {
         const numCols = Math.max(1, this.numCols || 1);
         if (this.isFixedFocusMode() && !this.wrap) {
@@ -605,12 +953,113 @@ export class ArrayGrid extends Group {
         this.topRow = Math.max(0, Math.min(this.topRow, maxTopRow));
     }
 
-    protected updateRect(rect: Rect, numRows: number, itemSize: number[]) {
+    /**
+     * Per-axis outset the reported bounding rect adds around the item extent when the focus
+     * bitmap is a 9-patch. This affects ONLY the rects reported by boundingRect() and friends,
+     * never the drawn focus frame (see focusMargins). Node types whose device-reported rect is
+     * exactly the laid-out item extent override this to zero (MarkupGrid).
+     */
+    protected rectMargins(): { x: number; y: number } {
+        if (this.hasNinePatch) {
+            return { x: this.marginX, y: this.marginY };
+        }
+        return { x: 0, y: 0 };
+    }
+
+    /**
+     * Whether this node lays its columns out from `columnWidths`/`columnSpacings`. Per the ArrayGrid
+     * reference those fields are "not used by lists", so only grids opt in.
+     */
+    protected usesColumnWidths(): boolean {
+        return false;
+    }
+
+    /**
+     * Resolves a per-row/per-column override array against its uniform fallback. Per the ArrayGrid
+     * reference the arrays are indexed by ABSOLUTE row/column, top to bottom, and any index past the
+     * end of the array falls back to the `itemSize`/`itemSpacing` value — it does NOT repeat the last
+     * entry (unlike `LayoutGroup.itemSpacings`, which is device-confirmed to repeat).
+     */
+    protected resolveTrackValue(values: unknown, index: number, fallback: number): number {
+        if (!Array.isArray(values)) {
+            return fallback;
+        }
+        const value = values[index];
+        return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+    }
+
+    /**
+     * Sizes the reported bounding rect to the laid-out extent.
+     *
+     * Inter-item spacing is part of that extent: the render loop advances by `itemSize + itemSpacing`
+     * per row/column, so N uniform rows span `N*itemH + (N-1)*spacing`. `boundingRect` reported only
+     * `N*itemH` before, omitting the gaps — an app centering a vertical menu via
+     * `(screenH - boundingRect().height)/2` then placed it too low by the total gap height.
+     *
+     * Rows and columns are not necessarily uniform, though: `rowHeights`/`rowSpacings` (and
+     * `columnWidths`/`columnSpacings` on grids) override `itemSize`/`itemSpacing` per track, and the
+     * render loops honor them. Measuring uniformly made every variable-height list report a rect that
+     * disagreed with what it drew.
+     *
+     * @param layout.firstRow Absolute index of the first RENDERED row — a scrolled list starts its
+     *   window at `topRow`, not 0, so the per-row overrides have to be indexed from there.
+     * @param layout.width/height An extent the caller already accumulated while laying out, which
+     *   wins over the arithmetic below. RowList and PosterGrid need this: their rows grow by amounts
+     *   (a label/counter band, a caption zone) that cannot be re-derived here without duplicating the
+     *   measurement.
+     */
+    protected updateRect(
+        rect: Rect,
+        numRows: number,
+        itemSize: number[],
+        layout?: { firstRow?: number; width?: number; height?: number }
+    ) {
         const numCols = this.numCols || 1;
-        rect.x = rect.x - (this.hasNinePatch ? this.marginX : 0);
-        rect.y = rect.y - (this.hasNinePatch ? this.marginY : 0);
-        rect.width = numCols * (itemSize[0] + (this.hasNinePatch ? this.marginX * 2 : 0));
-        rect.height = numRows * (itemSize[1] + (this.hasNinePatch ? this.marginY * 2 : 0));
+        const spacing = this.getValueJS("itemSpacing") as number[];
+        const colSpacing = Array.isArray(spacing) ? spacing[0] ?? 0 : 0;
+        const rowSpacing = Array.isArray(spacing) ? spacing[1] ?? 0 : 0;
+        const margin = this.rectMargins();
+        rect.x = rect.x - margin.x;
+        rect.y = rect.y - margin.y;
+
+        if (typeof layout?.width === "number") {
+            rect.width = layout.width;
+        } else if (this.usesColumnWidths()) {
+            const columnWidths = this.getValueJS("columnWidths");
+            const columnSpacings = this.getValueJS("columnSpacings");
+            let width = 0;
+            for (let c = 0; c < numCols; c++) {
+                width += this.resolveTrackValue(columnWidths, c, itemSize[0]) + margin.x * 2;
+                if (c < numCols - 1) {
+                    width += this.resolveTrackValue(columnSpacings, c, colSpacing);
+                }
+            }
+            rect.width = width;
+        } else {
+            rect.width = numCols * (itemSize[0] + margin.x * 2) + Math.max(0, numCols - 1) * colSpacing;
+        }
+
+        if (typeof layout?.height === "number") {
+            rect.height = layout.height;
+            return;
+        }
+        const rowHeights = this.getValueJS("rowHeights");
+        const rowSpacings = this.getValueJS("rowSpacings");
+        const totalRows = Math.max(1, Math.ceil(this.content.length / numCols));
+        const firstRow = layout?.firstRow ?? 0;
+        let height = 0;
+        for (let r = 0; r < numRows; r++) {
+            // A wrapping list renders a contiguous window that can run past the last row and resume
+            // at the top, so the override arrays are indexed modulo the row count.
+            const absolute = this.wrap ? (((firstRow + r) % totalRows) + totalRows) % totalRows : firstRow + r;
+            height += this.resolveTrackValue(rowHeights, absolute, itemSize[1]) + margin.y * 2;
+            if (r < numRows - 1) {
+                // Per the reference, rowSpacings[i] is the spacing AFTER row i, so the last rendered
+                // row contributes none.
+                height += this.resolveTrackValue(rowSpacings, absolute, rowSpacing);
+            }
+        }
+        rect.height = height;
     }
 
     protected getIndex(offset: number = 0, currIndex?: number) {

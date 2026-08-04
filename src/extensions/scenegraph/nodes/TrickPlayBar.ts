@@ -5,6 +5,7 @@ import { Label } from "./Label";
 import { Poster } from "./Poster";
 import { Group } from "./Group";
 import { sgRoot } from "../SGRoot";
+import { sgClock } from "../SGClock";
 
 export class TrickPlayBar extends Group {
     readonly defaultFields: FieldModel[] = [
@@ -27,6 +28,8 @@ export class TrickPlayBar extends Group {
     private readonly bmpIcons: Map<string, RoBitmap>;
     private stateIcon: RoBitmap | undefined;
     private stateIconTimeout: number = -1;
+    /** Clock captured on the last paint pass; layout passes reuse it instead of reading the clock. */
+    private lastPaintNow: number = 0;
 
     constructor(initializedFields: AAMember[] = [], readonly name: string = SGNodeType.TrickPlayBar) {
         super([], name);
@@ -69,6 +72,17 @@ export class TrickPlayBar extends Group {
             ["rw-x2", this.loadBitmap(`common:/images/${this.resolution}/icon_RWx2.png`)!],
             ["rw-x3", this.loadBitmap(`common:/images/${this.resolution}/icon_RWx3.png`)!],
         ]);
+    }
+
+    // The bar's visible parts (track, filled bar, ticker, time labels) are internal child
+    // nodes built in the constructor and held by private fields (this.backBack, this.barProgress,
+    // …). The Video exposes this bar as its `trickPlayBar` field, so it is serialized to a Task
+    // even though the Video itself no longer serializes its children. Opting out here keeps those
+    // internal children from being reconciled into fresh copies, which would leave the bar's field
+    // references pointing at nodes no longer in the render tree — so the bar would draw only its
+    // directly-painted state icon (ff/rw) and none of its child posters. See Node.serializesChildren.
+    serializesChildren(): boolean {
+        return false;
     }
 
     setValue(index: string, value: BrsType, alwaysNotify?: boolean, kind?: FieldKind) {
@@ -122,25 +136,34 @@ export class TrickPlayBar extends Group {
         }
         this.stateIcon = this.bmpIcons.get(iconName);
         if (this.stateIcon) {
-            this.stateIconTimeout = timeout > 0 ? Date.now() + timeout : -1;
+            this.stateIconTimeout = timeout > 0 ? sgClock.now() + timeout : -1;
         }
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible() || sgRoot.inTaskThread()) {
             this.updateRenderTracking(true);
             return;
         }
-        const drawTrans = this.getTranslation();
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
 
         const size = this.getDimensions();
         const rect = { x: drawTrans[0], y: drawTrans[1], width: size.width, height: size.height };
         opacity = opacity * this.getOpacity();
         this.updateBoundingRects(rect, origin, angle);
         this.renderChildren(interpreter, drawTrans, angle, opacity, draw2D);
-        if (this.stateIcon && (this.stateIconTimeout === -1 || this.stateIconTimeout > Date.now())) {
+        // Check the icon expiry against the clock only on a paint pass; a layout pass reuses the
+        // last paint's timestamp so the icon cannot flip mid-refresh (layout must be clock-free).
+        if (this.isPaintPass(draw2D)) {
+            this.lastPaintNow = sgClock.now();
+        }
+        if (this.stateIcon && (this.stateIconTimeout === -1 || this.stateIconTimeout > this.lastPaintNow)) {
             const iconRect = {
                 x: rect.x + (size.width - this.stateIcon.width) / 2,
                 y: rect.y + this.barH,

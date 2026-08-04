@@ -2,6 +2,7 @@ import {
     AAMember,
     Interpreter,
     BrsBoolean,
+    BrsDevice,
     BrsString,
     BrsType,
     Float,
@@ -9,7 +10,6 @@ import {
     RoArray,
     IfDraw2D,
     Rect,
-    RectRect,
     RoFont,
 } from "brs-engine";
 import { sgRoot } from "../SGRoot";
@@ -17,8 +17,11 @@ import { ContentNode } from "./ContentNode";
 import { brsValueOf, jsValueOf } from "../factory/Serializer";
 import { Font } from "./Font";
 import { Group } from "./Group";
+import { Node } from "./Node";
+import { Field } from "./Field";
 import { ArrayGrid, FocusStyle } from "./ArrayGrid";
 import { FieldKind, FieldModel } from "../SGTypes";
+import { resolveRowItemSubpart } from "../SGUtil";
 import { SGNodeType } from ".";
 
 const ValidFocusStyles = new Set(Object.values(FocusStyle).map((style) => style.toLowerCase()));
@@ -92,16 +95,30 @@ export class RowList extends ArrayGrid {
 
         if (this.resolution === "FHD") {
             this.marginX = 33;
-            this.marginY = 33;
+            // Vertical outset of THIS NODE's own reported rect (rectMargins -> ArrayGrid.updateRect).
+            // A real device reports a RowList's boundingRect outset by only ~6px on the Y axis, where
+            // the square 33 this used to hold was far too tall. It affects ONLY the reported rect, not
+            // the drawn focus frame: the focus RING uses the focus 9-patch's own declared content
+            // margins (ArrayGrid.focusMargins prefers them over this value).
+            //
+            // It does NOT reach an item subBoundingRect: Node.getSubBoundingRect re-expresses the item
+            // rect against this node's rectToParent/rectToScene, both of which now carry the outset
+            // identically, so it cancels. See resolveSubpart below — that cancellation is the whole
+            // reason the footprint outset that used to live here was wrong.
+            this.marginY = 6;
         } else {
             this.marginX = 22;
-            this.marginY = 22;
+            this.marginY = 4;
         }
         this.gap = 0;
         this.setValueSilent("focusBitmapUri", new BrsString(this.focusUri));
         this.setValueSilent("wrapDividerBitmapUri", new BrsString(this.dividerUri));
-        const vertStyle = this.getValueJS("vertFocusAnimationStyle") as string;
-        this.wrap = vertStyle.toLowerCase() === RowFocusStyle.Wrap;
+        // Re-derive the cached vertical focus style AFTER registerDefaultFields has installed RowList's
+        // own default (fixedFocus). ArrayGrid's constructor already ran applyVertFocusStyle(), but at
+        // that point the field still held ArrayGrid's floatingFocus default, and registerDefaultFields
+        // bypasses setValue — so the cache said "floatingfocus" while the field read "fixedFocus".
+        // renderContent branches on isFixedFocusMode(), so the two must agree.
+        this.applyVertFocusStyle();
         this.numRows = this.getValueJS("numRows") as number;
         this.numCols = this.getValueJS("numColumns") as number;
         this.rowFocus = [];
@@ -147,9 +164,30 @@ export class RowList extends ArrayGrid {
         }
         const oldRow = this.focusIndex;
         const isChangingRow = oldRow !== rowIndex;
+        // itemFocused/rowItemFocused only change when a row gains the key focus on a real device
+        // (verified on hardware). When the list is not in the focus chain — e.g. an app writes
+        // jumpToRowItem or assigns content while focus is elsewhere — update the cursor/scroll state
+        // but do NOT notify observers; setNodeFocus re-emits on focus-gain. See ArrayGrid.setFocusedItem.
+        const inFocusChain = sgRoot.focused === this || this.isChildrenFocused();
 
-        if (isChangingRow) {
-            super.setValue("itemUnfocused", new Int32(oldRow));
+        if (inFocusChain) {
+            // Emit the scroll pulse before ANY of the settled focus fields go out — itemUnfocused
+            // below included, so the order matches ArrayGrid.setFocusedItem. See armScrollPulse for
+            // why the pulse precedes the settle, and why it is skipped entirely when the list is
+            // outside the focus chain (that path notifies nothing).
+            this.emitScrollPulse();
+        }
+
+        if (isChangingRow && inFocusChain) {
+            // Engine-initiated emission (not a direct BrightScript assignment): on Roku its
+            // observers dispatch from the message loop, so a reentrant notification defers
+            // (see Field.enterInternalUpdate).
+            Field.enterInternalUpdate();
+            try {
+                super.setValue("itemUnfocused", new Int32(oldRow));
+            } finally {
+                Field.exitInternalUpdate();
+            }
         }
 
         this.focusIndex = rowIndex;
@@ -166,10 +204,8 @@ export class RowList extends ArrayGrid {
 
         const spacing = this.getRowItemSpacing(rowIndex); // Use the actual row's spacing
         const rowItemWidth = this.getRowItemWidth(rowIndex);
-        const cols = this.content[rowIndex]?.getNodeChildren();
-        const numCols = cols?.length ?? 0;
-        const totalRowWidth = numCols * rowItemWidth + (numCols - 1) * spacing[0];
-        const allItemsFitOnScreen = totalRowWidth <= this.sceneRect.width;
+        const cols = this.getContentChildren(this.content[rowIndex]);
+        const allItemsFitOnScreen = this.allItemsFitOnScreen(rowIndex, cols);
 
         // Adjust scroll offset based on animation style
         if (allItemsFitOnScreen && rowFocusStyle !== RowFocusStyle.Fixed) {
@@ -210,8 +246,63 @@ export class RowList extends ArrayGrid {
             }
         }
 
-        super.setValue("itemFocused", new Int32(rowIndex));
-        super.setValue("rowItemFocused", new RoArray([new Int32(rowIndex), new Int32(colIndex)]));
+        if (inFocusChain) {
+            // Engine-initiated emission: reentrant observers defer (see Field.enterInternalUpdate).
+            Field.enterInternalUpdate();
+            try {
+                super.setValue("itemFocused", new Int32(rowIndex));
+            } finally {
+                Field.exitInternalUpdate();
+            }
+            this.setRowItemFocused(rowIndex, colIndex);
+        } else {
+            // Unfocused: remember the row/column silently (no observer notification). The values are
+            // re-emitted by setNodeFocus when focus lands on the list.
+            this.focusLayoutDirty = true;
+            this.setValueSilent("itemFocused", new Int32(rowIndex));
+            this.setValueSilent("currFocusRow", new Float(rowIndex));
+            this.setValueSilent("currFocusColumn", new Float(colIndex));
+            this.setValueSilent("rowItemFocused", new RoArray([new Int32(rowIndex), new Int32(colIndex)]));
+        }
+    }
+
+    /**
+     * Records the focused [row, column] and mirrors it into the inherited ArrayGrid
+     * currFocusRow/currFocusColumn fields. Roku keeps those two fields in sync with the focus
+     * position as the grid scrolls (see arraygrid.md); apps observe/alias them to track which
+     * row and column is focused. Without this mirror they stay pinned at their 0.0 default, so an
+     * app driving a focused-item overlay from currFocusRow/currFocusColumn never leaves item [0,0].
+     */
+    protected setRowItemFocused(rowIndex: number, colIndex: number) {
+        // The focus/scroll position is about to change, so the item components' cached rects no
+        // longer match it (the newly focused row/column has not been re-laid-out yet). Mark layout
+        // dirty BEFORE firing the focus fields below: an app's rowItemFocused observer measures the
+        // focused item synchronously via subBoundingRect, and the dirty flag makes that query refresh
+        // layout first so it reports the settled focus-band position (see needsSubBoundingRectRefresh).
+        this.focusLayoutDirty = true;
+        // Emit the scroll pulse BEFORE the settled focus fields go out — the falling edge precedes
+        // the settle on a device and apps rely on that order (see ArrayGrid.armScrollPulse). The
+        // horizontal handlers reach this method directly, without setFocusedItem, so the pulse has to
+        // be emitted here too; it is idempotent per key press, so the vertical path (which already
+        // pulsed) does not double-emit. Outside the internal-update bracket below on purpose: these
+        // notifications must dispatch synchronously rather than defer past the settle.
+        this.emitScrollPulse();
+        // Engine-initiated emissions: reentrant observers defer (see Field.enterInternalUpdate).
+        Field.enterInternalUpdate();
+        try {
+            // Emit currFocusRow/currFocusColumn BEFORE rowItemFocused. On a real device the focus fields
+            // pass through in-transit (fractional) values during the scroll animation and rowItemFocused
+            // settles last, so apps treat the rowItemFocused observer as the authoritative "focus settled"
+            // callback (e.g. the one that positions a per-row overlay on the final row). Since our scroll is
+            // instant, honoring that ordering — the settle notification fires last — keeps such an app from
+            // being stranded in its transient state (an observer on currFocusRow that computes an in-transit
+            // row from the scroll direction would otherwise run last and win). Regression: RowList.test.js.
+            super.setValue("currFocusRow", new Float(rowIndex));
+            super.setValue("currFocusColumn", new Float(colIndex));
+            super.setValue("rowItemFocused", new RoArray([new Int32(rowIndex), new Int32(colIndex)]));
+        } finally {
+            Field.exitInternalUpdate();
+        }
     }
 
     protected handleUpDown(key: string) {
@@ -268,8 +359,12 @@ export class RowList extends ArrayGrid {
             }
 
             const rowItem = new RoArray([new Int32(nextRow), new Int32(targetColIndex)]);
-            this.currRow += this.wrap ? 0 : offset; // Update currRow before setFocusedItem
+            // Publish the vertical scroll direction BEFORE the focus change so observers of the focus
+            // fields see the correct direction, then reset it to "none" after (mirroring a real device,
+            // where the direction is transient and settles back to none once scrolling completes).
+            super.setValue("vertFocusDirection", new BrsString(offset > 0 ? "down" : "up"));
             this.setValue("jumpToRowItem", rowItem);
+            super.setValue("vertFocusDirection", new BrsString("none"));
             handled = true;
         }
         return handled;
@@ -282,9 +377,11 @@ export class RowList extends ArrayGrid {
     protected handleLeftRight(key: string) {
         const offset = key === "left" ? -1 : 1;
         const currentRow = this.focusIndex;
-        const cols = this.content[currentRow]?.getNodeChildren();
-        const numCols = cols?.length ?? 0;
+        const cols = this.getContentChildren(this.content[currentRow]);
+        const numCols = cols.length;
 
+        // No row under the cursor (content not assigned yet, or an empty content tree), or a single
+        // column: nothing to move to, so the key is unhandled and bubbles to the parent.
         if (numCols <= 1) {
             return false;
         }
@@ -292,7 +389,7 @@ export class RowList extends ArrayGrid {
         this.rowScrollOffset[currentRow] ??= 0;
 
         const rowItemWidth = this.getRowItemWidth(currentRow);
-        const allItemsFitOnScreen = this.checkIfAllItemsFitOnScreen(numCols, rowItemWidth);
+        const allItemsFitOnScreen = this.allItemsFitOnScreen(currentRow, cols);
         const rowFocusStyle = (this.getValueJS("rowFocusAnimationStyle") as string).toLowerCase();
 
         if (allItemsFitOnScreen && rowFocusStyle !== RowFocusStyle.Fixed) {
@@ -307,7 +404,10 @@ export class RowList extends ArrayGrid {
     }
 
     protected handleOK(press: boolean) {
-        if (press && this.focusIndex >= 0 && this.focusIndex < this.rowFocus.length) {
+        // Bound by the content view, not by `rowFocus` — the latter is seeded with row 0 in the
+        // constructor, so an empty list would otherwise report row 0 as selected and consume the key.
+        // With no content there is no item to select, so the key stays unhandled (device behavior).
+        if (press && this.focusIndex >= 0 && this.focusIndex < this.content.length) {
             const currentRow = this.focusIndex;
             const currentCol = this.rowFocus[currentRow];
             if (currentCol >= 0) {
@@ -317,6 +417,39 @@ export class RowList extends ArrayGrid {
             }
         }
         return false;
+    }
+
+    /**
+     * Resolves an ifSGNodeBoundingRect sub part to the matching rendered item component. A RowList
+     * holds a 2-D grid of components in `rowItemComps[row][col]` (not the flat ArrayGrid `itemComps[]`,
+     * which stays empty here), so the base resolver never matches and every query falls back to the
+     * whole-list rect. On a real device `subBoundingRect("item<row>_<col>")` returns the focused
+     * poster's rect, which apps use to place a focused-item overlay; without this override the overlay
+     * cannot track the row's item layout. See `resolveRowItemSubpart` for the id mapping.
+     *
+     * Resolution is ALL this node contributes: there is intentionally no `getSubBoundingRect` override.
+     * `Node.getSubBoundingRect` re-expresses the resolved item component's own rect, and a device reports
+     * exactly that — the bare poster — for both the focused and the unfocused cells. Three separate
+     * outsets are easy to conflate here, so keep them apart:
+     *
+     *  - the DRAWN focus frame is outset (`ArrayGrid.renderFocus` -> `focusMargins`, the 9-patch's own
+     *    declared content margins). That is paint only; nothing reports it.
+     *  - THIS NODE's own reported rect is outset (`rectMargins` -> `ArrayGrid.updateRect`, `marginX`/
+     *    `marginY`). It does not reach an item sub-rect: `Node.getSubBoundingRect` computes
+     *    `base.y + (subScene.y - this.rectToScene.y)`, and `base` (`rectToParent`/`rectLocal`) and
+     *    `rectToScene` carry that outset identically, so it cancels.
+     *  - an ITEM sub-rect is outset by nothing at all.
+     *
+     * Do NOT re-add a focus-footprint outset here. One was added once (subtracting the 9-patch top
+     * margin from the focused cell) to make an overlay land on the poster; it was double-counting from
+     * the day it landed, silently cancelled by a `rectToParent` bug that dropped the `rectMargins`
+     * outset from `base` and left a `+marginY` residue in the expression above. Fixing that bug — so
+     * the outset cancels as it should — surfaced the double subtraction as an overlay drawn one focus
+     * margin too HIGH. If a focused-item overlay looks misplaced, the paint path or the app's own
+     * offset is the suspect, not this rect.
+     */
+    protected resolveSubpart(itemNumber: string): Node | undefined {
+        return resolveRowItemSubpart(itemNumber, this.rowItemComps, this.focusIndex, this.rowFocus);
     }
 
     private getRowItemSize(rowIndex: number): number[] {
@@ -330,6 +463,24 @@ export class RowList extends ArrayGrid {
         return this.getRowItemSize(rowIndex)[0];
     }
 
+    /**
+     * Width of a single item. Uniform rows use the row's `rowItemSize.x`; a row flagged in
+     * `variableWidthItems` instead takes each item's width from the `[SD/HD/FHD]ItemWidth` field of
+     * its ContentNode (the resolution matching the manifest `ui_resolutions`), falling back to the
+     * row's `rowItemSize.x` when an item does not specify one — per the RowList reference.
+     * @param rowIndex Absolute row index.
+     * @param colIndex Column (item) index within the row.
+     * @param cols The row's content children.
+     * @param rowItemWidth The row's uniform width (fallback and non-variable result).
+     */
+    private getItemWidth(rowIndex: number, colIndex: number, cols: ContentNode[], rowItemWidth: number): number {
+        if (!this.resolveBoolean(this.getValueJS("variableWidthItems"), rowIndex, false)) {
+            return rowItemWidth;
+        }
+        const itemWidth = cols[colIndex]?.getValueJS(`${sgRoot.resolution}ItemWidth`);
+        return typeof itemWidth === "number" && itemWidth > 0 ? itemWidth : rowItemWidth;
+    }
+
     private getRowItemSpacing(rowIndex: number): number[] {
         let fallback = [0, 0];
         const itemSpacing = this.getValueJS("itemSpacing") as number[];
@@ -339,11 +490,30 @@ export class RowList extends ArrayGrid {
         return this.resolveVector(this.getValueJS("rowItemSpacing"), rowIndex, fallback);
     }
 
-    private checkIfAllItemsFitOnScreen(numCols: number, rowItemWidth: number): boolean {
-        // Use the focused row's spacing (this.focusIndex is the absolute row index)
-        const spacing = this.getRowItemSpacing(this.focusIndex);
-        const totalRowWidth = numCols * rowItemWidth + (numCols - 1) * spacing[0];
-        return totalRowWidth <= this.sceneRect.width;
+    /**
+     * Total laid-out width of a row's items plus inter-item spacing. For variable-width rows this sums
+     * each item's actual width (`getItemWidth`, which resolves the item's `[res]ItemWidth`) instead of
+     * `numCols * rowItemSize.x` — an app can set `rowItemSize.x` to the whole row/bar width (e.g. SGDEX
+     * ButtonBar) while the individual buttons are far narrower, so the uniform estimate hugely
+     * overshoots and makes the list think its items don't fit. Reduces to the uniform formula for
+     * non-variable rows.
+     */
+    private getTotalRowWidth(rowIndex: number, cols: ContentNode[]): number {
+        const numCols = cols.length;
+        if (numCols === 0) {
+            return 0;
+        }
+        const spacing = this.getRowItemSpacing(rowIndex);
+        const rowItemWidth = this.getRowItemWidth(rowIndex);
+        let total = (numCols - 1) * spacing[0];
+        for (let c = 0; c < numCols; c++) {
+            total += this.getItemWidth(rowIndex, c, cols, rowItemWidth);
+        }
+        return total;
+    }
+
+    private allItemsFitOnScreen(rowIndex: number, cols: ContentNode[]): boolean {
+        return this.getTotalRowWidth(rowIndex, cols) <= this.sceneRect.width;
     }
 
     private handleAllItemsFit(currentRow: number, numCols: number, offset: number): boolean {
@@ -352,7 +522,7 @@ export class RowList extends ArrayGrid {
 
         if (nextCol !== this.rowFocus[currentRow]) {
             this.rowFocus[currentRow] = nextCol;
-            super.setValue("rowItemFocused", new RoArray([new Int32(currentRow), new Int32(nextCol)]));
+            this.setRowItemFocused(currentRow, nextCol);
             return true;
         }
         return false;
@@ -368,7 +538,7 @@ export class RowList extends ArrayGrid {
         }
 
         this.rowFocus[currentRow] = nextCol;
-        super.setValue("rowItemFocused", new RoArray([new Int32(currentRow), new Int32(nextCol)]));
+        this.setRowItemFocused(currentRow, nextCol);
         return true;
     }
 
@@ -379,7 +549,7 @@ export class RowList extends ArrayGrid {
         if (nextCol !== this.rowFocus[currentRow]) {
             this.rowFocus[currentRow] = nextCol;
             this.rowScrollOffset[currentRow] = nextCol;
-            super.setValue("rowItemFocused", new RoArray([new Int32(currentRow), new Int32(nextCol)]));
+            this.setRowItemFocused(currentRow, nextCol);
             return true;
         }
         return false;
@@ -414,8 +584,7 @@ export class RowList extends ArrayGrid {
         }
 
         if (handled) {
-            const value = new RoArray([new Int32(currentRow), new Int32(this.rowFocus[currentRow])]);
-            super.setValue("rowItemFocused", value);
+            this.setRowItemFocused(currentRow, this.rowFocus[currentRow]);
         }
         return handled;
     }
@@ -473,18 +642,42 @@ export class RowList extends ArrayGrid {
             return;
         }
         const context = this.initializeRenderContext(rect, interpreter, rotation, opacity, draw2D);
-        this.currRow = this.focusIndex;
+        // `currRow` is the ABSOLUTE index of the first row drawn (see calculateActualRowIndex), so it
+        // is what decides how far the list has scrolled internally. Per Roku, fixedFocus/fixedFocusWrap
+        // pin the focused row at the list top and scroll the rows above it off screen; floatingFocus
+        // instead keeps rows at fixed positions and only scrolls "if there are rows that were not
+        // visible" — i.e. never once numRows covers the whole content. Applying the fixedFocus rule to
+        // every style made a floatingFocus list scroll a full row pitch per Up/Down even when all its
+        // rows fit, which compounds with any translation an app applies to the node itself.
+        if (this.isFixedFocusMode()) {
+            this.currRow = this.focusIndex;
+        } else {
+            this.updateListCurrRow(); // maintains this.topRow, the first visible row of the window
+            this.currRow = this.topRow;
+        }
 
+        // Rows advance by their own height plus, when the label/counter band does not fit in the row's
+        // slack, that band's height (see renderSingleRow). No arithmetic in updateRect can reproduce
+        // that without re-measuring the label, so accumulate the extent the loop actually laid out and
+        // hand it over. `itemRect.y` ends one rowSpacing past the last row, which is dropped below.
+        const startY = context.itemRect.y;
+        let renderedRows = 0;
+        let trailingSpacing = 0;
         for (let r = 0; r < context.displayRows; r++) {
             const rowIndex = this.calculateActualRowIndex(r);
             if (rowIndex === -1) {
                 break;
             }
-            if (!this.renderSingleRow(rowIndex, r, context)) {
+            const fits = this.renderSingleRow(rowIndex, r, context);
+            renderedRows++;
+            trailingSpacing = this.calculateRowSpacing(rowIndex, context.rowSpacings, context.globalSpacing);
+            if (!fits) {
                 break;
             }
         }
-        this.updateRect(rect, context.displayRows, context.itemSize);
+        const margin = this.rectMargins();
+        const height = renderedRows === 0 ? 0 : context.itemRect.y - startY - trailingSpacing + margin.y * 2;
+        this.updateRect(rect, context.displayRows, context.itemSize, { height, firstRow: this.currRow });
     }
 
     private validateRenderPrerequisites(): boolean {
@@ -606,9 +799,14 @@ export class RowList extends ArrayGrid {
                 height: this.sceneRect.height,
             });
         }
-        this.renderRowContent(rowIndex, cols, numCols, context.rowItemWidth, spacing, context.itemRect, context);
-        if (clip) {
-            context.draw2D?.popClip();
+        try {
+            // Row items are app components: an error escaping their BrightScript must not strand the
+            // row clip on the canvas for the rest of the frame.
+            this.renderRowContent(rowIndex, cols, context.rowItemWidth, spacing, context.itemRect, context);
+        } finally {
+            if (clip) {
+                context.draw2D?.popClip();
+            }
         }
 
         // Render the "N of M" row counter in the label band at the row top, AFTER the items.
@@ -621,7 +819,14 @@ export class RowList extends ArrayGrid {
         const rowSpacing = this.calculateRowSpacing(rowIndex, context.rowSpacings, context.globalSpacing);
         context.itemRect.y = rowTopY + rowHeight + (bandFits ? 0 : bandHeight) + rowSpacing;
 
-        return RectRect(this.sceneRect, context.itemRect);
+        // Stop only once the next row starts BELOW the viewport — everything after it is off screen.
+        // A row entirely ABOVE the viewport must not end the pass: this used to test the next row for
+        // intersection with the scene, which was safe only while rendering always began at the focused
+        // (on-screen) row. With floatingFocus the pass begins at the window's top row, so an app that
+        // scrolls by translating the list itself can park earlier rows off the top — and a full row of
+        // clearance up there would abort the pass before reaching the focused row, blanking it and
+        // every row below it.
+        return context.itemRect.y < this.sceneRect.y + this.sceneRect.height;
     }
 
     private getRowXOffset(rowIndex: number): number {
@@ -638,14 +843,12 @@ export class RowList extends ArrayGrid {
     private renderRowContent(
         rowIndex: number,
         cols: ContentNode[],
-        numCols: number,
         rowItemWidth: number,
         spacing: number[],
         itemRect: Rect,
         context: RowListRenderContext
     ): void {
-        const totalRowWidth = numCols * rowItemWidth + (numCols - 1) * spacing[0];
-        const allItemsFitOnScreen = totalRowWidth <= this.sceneRect.width;
+        const allItemsFitOnScreen = this.allItemsFitOnScreen(rowIndex, cols);
         const rowFocusStyle = (this.getValueJS("rowFocusAnimationStyle") as string).toLowerCase();
 
         this.rowScrollOffset[rowIndex] ??= 0;
@@ -709,8 +912,13 @@ export class RowList extends ArrayGrid {
             startCol = this.rowScrollOffset[rowIndex] ?? 0;
         }
 
+        // With variable-width items the uniform maxVisibleItems estimate can undercount how many
+        // narrower items fit, cutting off the tail of the row; render through the last column and let
+        // the right-edge break below stop the loop once an item lands off-screen.
+        const variableWidth = this.resolveBoolean(this.getValueJS("variableWidthItems"), rowIndex, false);
         const maxVisibleItems = Math.ceil((this.sceneRect.width + spacing[0]) / (rowItemWidth + spacing[0]));
-        const endCol = renderMode === "wrapMode" ? numCols : Math.min(startCol + maxVisibleItems, numCols);
+        const endCol =
+            renderMode === "wrapMode" || variableWidth ? numCols : Math.min(startCol + maxVisibleItems, numCols);
 
         // In wrap mode the focused item sits at the fixed focus offset; the row wraps in BOTH
         // directions, so the tail end of the preceding (wrapped) item is partially visible in the
@@ -748,6 +956,10 @@ export class RowList extends ArrayGrid {
                 break;
             }
 
+            // Size the slot to this specific item (a no-op for uniform rows) so the item component is
+            // sized correctly and the next item advances by this item's own width — otherwise variable
+            // items are positioned on a uniform pitch and overlap (or leave gaps).
+            itemRect.width = this.getItemWidth(rowIndex, colIndex, cols, rowItemWidth);
             this.renderRowItemComponent(
                 context.interpreter,
                 rowIndex,
@@ -766,6 +978,22 @@ export class RowList extends ArrayGrid {
         }
     }
 
+    private itemCompFailureLogged = false;
+
+    /** Writes a single error (not one per slot/frame) when item components cannot be created. */
+    private logItemCompFailure() {
+        if (this.itemCompFailureLogged) {
+            return;
+        }
+        this.itemCompFailureLogged = true;
+        const itemCompName = this.getValueJS("itemComponentName") ?? "";
+        BrsDevice.stderr.write(
+            `error,[sg.rowlist.create.fail] Failed to create item component: ${
+                itemCompName || "missing 'itemComponentName'"
+            }`
+        );
+    }
+
     protected renderRowItemComponent(
         interpreter: Interpreter,
         rowIndex: number,
@@ -779,14 +1007,8 @@ export class RowList extends ArrayGrid {
         const content = cols[colIndex];
         const nodeFocus = sgRoot.focused === this;
 
-        // Check if all items in this row fit on screen by checking if last item fits
-        const numCols = cols.length;
-        const rowItemWidth = itemRect.width;
-        const spacing = this.getRowItemSpacing(rowIndex);
-        const lastItemX =
-            itemRect.x - colIndex * (rowItemWidth + spacing[0]) + (numCols - 1) * (rowItemWidth + spacing[0]);
-        const lastItemRightEdge = lastItemX + rowItemWidth;
-        const allItemsFitOnScreen = lastItemRightEdge <= this.sceneRect.width;
+        // Sum the row's actual (possibly variable) item widths to decide whether it all fits.
+        const allItemsFitOnScreen = this.allItemsFitOnScreen(rowIndex, cols);
 
         // Determine focus behavior based on animation style and screen fit
         let focused = false;
@@ -809,17 +1031,34 @@ export class RowList extends ArrayGrid {
         }
         // Update the component's focus state
         const itemComp = this.rowItemComps[rowIndex][colIndex];
-        if (itemComp) {
-            itemComp.setValue("rowHasFocus", BrsBoolean.from(this.focusIndex === rowIndex), false);
-            itemComp.setValue(this.focusField, BrsBoolean.from(nodeFocus), false);
-            itemComp.setValue("itemHasFocus", BrsBoolean.from(focused), false);
-            if (content.changed) {
-                itemComp.setValue("itemContent", content, true);
-                content.changed = false;
-            }
-            itemComp.setValue("focusPercent", new Float(focused ? 1 : 0), false);
-            itemComp.setValue("rowFocusPercent", new Float(this.focusIndex === rowIndex ? 1 : 0), false);
+        if (!itemComp) {
+            // Item component creation failed (e.g. an unresolvable itemComponentName): skip the
+            // slot instead of crashing the whole render pass on the undefined reference.
+            this.logItemCompFailure();
+            return;
         }
+        // Re-apply the per-item size every frame. The item component's width/height are otherwise
+        // only set at creation time (createItemComponent); if item [0] is first created while the
+        // list is still using its full-width `itemSize` fallback (before the app assigns the real
+        // `rowItemSize`), it would stay frozen at full row width — stretching the first poster.
+        // `itemRect` carries the authoritative per-item dimensions (see initializeRowRenderContext).
+        itemComp.setValue("width", new Float(itemRect.width), false);
+        itemComp.setValue("height", new Float(itemRect.height), false);
+        itemComp.setValue("rowHasFocus", BrsBoolean.from(this.focusIndex === rowIndex), false);
+        itemComp.setValue(this.focusField, BrsBoolean.from(nodeFocus), false);
+        // itemHasFocus is true only when this item is the focused column AND the list itself has
+        // focus. Per the RowList reference, "if the RowList does not focus, all itemHasFocus fields
+        // ... should be false". Gating on nodeFocus makes the field transition (and its observers
+        // fire) when the list gains/loses focus while the same item stays the focused column —
+        // otherwise a button focused on the first render never shows its focused state once the list
+        // is focused afterwards (focusPercent stays 1, so a focusPercent observer never re-fires).
+        itemComp.setValue("itemHasFocus", BrsBoolean.from(focused && nodeFocus), false);
+        if (content.changed) {
+            itemComp.setValue("itemContent", content, true);
+            content.changed = false;
+        }
+        itemComp.setValue("focusPercent", new Float(focused ? 1 : 0), false);
+        itemComp.setValue("rowFocusPercent", new Float(this.focusIndex === rowIndex ? 1 : 0), false);
 
         const drawFocus = this.getValueJS("drawFocusFeedback");
         const drawFocusOnTop = this.getValueJS("drawFocusFeedbackOnTop");
@@ -827,7 +1066,7 @@ export class RowList extends ArrayGrid {
             this.renderFocus(itemRect, opacity, nodeFocus, draw2D);
         }
         const itemOrigin = [itemRect.x, itemRect.y];
-        this.rowItemComps[rowIndex][colIndex].renderNode(interpreter, itemOrigin, rotation, opacity, draw2D);
+        itemComp.renderNode(interpreter, itemOrigin, rotation, opacity, draw2D);
         if (focused && drawFocus && drawFocusOnTop) {
             this.renderFocus(itemRect, opacity, nodeFocus, draw2D);
         }
@@ -847,7 +1086,7 @@ export class RowList extends ArrayGrid {
             return;
         }
         const showShortRows = (this.getValueJS("showRowCounterForShortRows") as boolean) ?? true;
-        if (!showShortRows && this.checkIfAllItemsFitOnScreen(numCols, context.rowItemWidth)) {
+        if (!showShortRows && this.allItemsFitOnScreen(rowIndex, this.getContentChildren(this.content[rowIndex]))) {
             return;
         }
         const font = this.getValue("rowLabelFont") as Font;

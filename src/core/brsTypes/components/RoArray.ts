@@ -10,6 +10,7 @@ import {
     isBrsBoolean,
     isAnyNumber,
     jsValueOf,
+    isNumberKind,
 } from "..";
 import { BrsValue, ValueKind, BrsString, BrsBoolean, BrsInvalid, Comparable } from "../BrsType";
 import { BrsComponent } from "./BrsComponent";
@@ -36,6 +37,10 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
         this.elements = [];
         if (args.length === 1 && Array.isArray(args[0])) {
             for (const element of args[0]) {
+                if (isBoxable(element) && isNumberKind(element.kind) && element.legacy) {
+                    // set the literal flag of numeric values, when legacy was already set, to cover a Roku edge case for Type()
+                    element.literal = true;
+                }
                 this.addChildRef(element);
                 this.elements.push(element);
             }
@@ -162,6 +167,15 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
         return new RoArray(copiedElements);
     }
 
+    boxLiterals() {
+        for (let i = 0; i < this.elements.length; i++) {
+            const element = this.elements[i];
+            if (isBoxable(element) && !(element instanceof Callable)) {
+                this.elements[i] = element.box();
+            }
+        }
+    }
+
     get(index: BrsType) {
         if (isBoxedNumber(index)) {
             index = index.unbox();
@@ -284,14 +298,16 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
             args: [new StdlibArgument("separator", ValueKind.String)],
             returns: ValueKind.String,
         },
-        impl: (_: Interpreter, separator: BrsString) => {
+        impl: (interpreter: Interpreter, separator: BrsString) => {
             if (
                 this.elements.some(function (element) {
-                    return !(element instanceof BrsString);
+                    return !isBrsString(element);
                 })
             ) {
                 if (BrsDevice.isDevMode) {
-                    BrsDevice.stderr.write("warning,roArray.Join: Array contains non-string value(s).");
+                    BrsDevice.stderr.write(
+                        `warning,roArray.Join: Array contains non-string value(s). ${interpreter.formatLocation()}`
+                    );
                 }
                 return new BrsString("");
             }
@@ -305,7 +321,7 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
             args: [new StdlibArgument("flags", ValueKind.String, new BrsString(""))],
             returns: ValueKind.Void,
         },
-        impl: (_: Interpreter, flags: BrsString) => {
+        impl: (interpreter: Interpreter, flags: BrsString) => {
             if (flags.toString().match(/([^ir])/g) == null) {
                 const caseInsensitive = flags.toString().includes("i");
                 const originalArrayCopy = [...this.elements];
@@ -316,7 +332,9 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
                     this.elements.reverse();
                 }
             } else if (BrsDevice.isDevMode) {
-                BrsDevice.stderr.write("warning,roArray.Sort: Flags contains invalid option(s).");
+                BrsDevice.stderr.write(
+                    `warning,roArray.Sort: Flags contains invalid option(s). ${interpreter.formatLocation()}`
+                );
             }
             return BrsInvalid.Instance;
         },
@@ -330,7 +348,7 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
             ],
             returns: ValueKind.Void,
         },
-        impl: (_: Interpreter, fieldName: BrsString, flags: BrsString) => {
+        impl: (interpreter: Interpreter, fieldName: BrsString, flags: BrsString) => {
             if (flags.toString().match(/([^ir])/g) == null) {
                 const originalArrayCopy = [...this.elements];
                 this.elements.sort((a, b) => {
@@ -346,7 +364,9 @@ export class RoArray extends BrsComponent implements BrsValue, BrsArray {
                     this.elements.reverse();
                 }
             } else if (BrsDevice.isDevMode) {
-                BrsDevice.stderr.write("warning,roArray.SortBy: Flags contains invalid option(s).");
+                BrsDevice.stderr.write(
+                    `warning,roArray.SortBy: Flags contains invalid option(s). ${interpreter.formatLocation()}`
+                );
             }
             return BrsInvalid.Instance;
         },

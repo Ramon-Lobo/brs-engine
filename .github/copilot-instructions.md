@@ -72,9 +72,10 @@
 ```bash
 npm run build          # Build all three packages (outputs to packages/*/lib and packages/*/bin)
 npm run build:web      # Build browser + scenegraph packages and launch dev server
-npm run build:cli      # Build Node.js package only
+npm run build:node     # Build Node.js package only
+npm run build:cli      # Build Node.js + scenegraph packages
 npm run build:sg       # Build scenegraph extension package only
-npm run test           # Run Jest tests
+npm run test           # Run Vitest tests
 npm run start          # Start webpack dev server for browser package
 ```
 
@@ -451,7 +452,7 @@ Common pattern: `src/core/index.ts` uses `/// #if BROWSER` to set up Worker `onm
 - Zip packages auto-extracted to `pkg:/` on execution
 
 ### Testing Patterns
-- **Jest** tests in `test/` mirror source structure
+- **Vitest** tests in `test/` mirror source structure
 - **End-to-end tests** in `test/e2e/` run full BrightScript files
 - **Simulator tests** in `test/simulator/` contain `.brs` files exercising runtime features
 - Use `execute(source)` helper from interpreter tests to run BrightScript code snippets

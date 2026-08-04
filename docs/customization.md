@@ -24,6 +24,8 @@ const deviceInfo = {
   localIps: ["eth1,127.0.0.1"], // In a Browser isn't possible to get a real IP, populate it on NodeJS or Electron
   audioVolume: 50, // Defines the default volume level for system sounds - valid: (0-100)
   audioLanguage: "en", // Preferred audio track language
+  autoPlayEnabled: true, // Autoplay device setting, returned by `roDeviceInfo.IsAutoplayEnabled()` (default: enabled)
+  minVideoBufferMs: 700, // Simulated minimum buffering floor (ms) before video playback starts
   maxFps: 60, // Maximum frames per second for rendering
   tmpVolSize: 32 * 1024 * 1024, // Allocated size for `tmp:/` volume (32 MB)
   cacheFSVolSize: 32 * 1024 * 1024, // Allocated size for `cachefs:/` volume (32 MB)
@@ -46,7 +48,7 @@ Below is a table with the extended set of features, internally created by the en
 | Feature Name | Description |
 |--------------|-------------|
 | `simulation_engine` | Always `true` when running under `brs-engine` |
-| `ascii_rendering` | Returns `true` when running in the terminal in ASCII screen mode, see the [CLI doc](run-as-cli.md) for more details |
+| `platform_cli` | Returns `true` when running in the terminal, see the [CLI doc](run-as-cli.md) for more details |
 | `platform_browser` | Returns `true` when running under a Browser |
 | `platform_chromium` | Returns `true` when running under Chromium |
 | `platform_firefox` | Returns `true` when running under Firefox |

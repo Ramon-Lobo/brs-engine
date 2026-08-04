@@ -28,12 +28,14 @@ import {
     RuntimeError,
     DebugMode,
     Uninitialized,
+    BrsDevice,
 } from "brs-engine";
 import { Node } from "./Node";
 import { RoSGNodeEvent } from "../events/RoSGNodeEvent";
 import { getValueKindFromFieldType } from "../factory/NodeFactory";
 import { fromAssociativeArray, toAssociativeArray, jsValueOf } from "../factory/Serializer";
 import { BrsCallback, FieldKind, isContentNode } from "../SGTypes";
+import { convertHexColor } from "../SGUtil";
 
 export class Field {
     // Observer collections are allocated lazily. A node like ContentNode registers ~100 default
@@ -45,6 +47,162 @@ export class Field {
     private scopedObservers?: Map<Node, BrsCallback[]>;
     /** True while this field's observers are dispatching, to break re-entrant cascades. */
     private notifying = false;
+
+    // ---- Roku-accurate deferred observer dispatch (per Worker thread) -------------------------
+    // On a real Roku, a DIRECT BrightScript field assignment (`node.field = x`) on the owning
+    // thread fires function-name observers synchronously, even nested inside another observer —
+    // apps rely on set-then-read-back (assign a field, immediately read a value the observer
+    // computed). What Roku dispatches from the message loop are fields changed by a node's
+    // INTERNAL machinery (e.g. `itemFocused` emitted by an ArrayGrid processing `jumpToItem`,
+    // `content`, or a focus move): those observers do not run reentrantly in the middle of another
+    // observer's execution. We reproduce that: when a Callable observer for an engine-initiated
+    // emission (`internalUpdateDepth` > 0) would fire while another Callable observer is already
+    // executing (reentrant) — and the notification is not part of a ContentNode parentField
+    // cascade — we queue it and drain it FIFO once the outermost dispatch unwinds.
+    // Same-field re-notification (`notifying`) and same-ContentNode re-entry (`propagating`) are
+    // still suppressed before reaching this path, so the #904/#905/#943 cascades are unaffected.
+    /** Depth of Callable observers currently executing on this thread (the reentrancy gate). */
+    private static observerDepth = 0;
+    /** >0 while inside `ContentNode.notifyParentFields`; disables deferral for cascade observers. */
+    private static parentCascadeDepth = 0;
+    /**
+     * >0 while engine machinery (not app BrightScript) is emitting field changes — grid focus
+     * bookkeeping such as `itemFocused`/`rowItemFocused`. Only those notifications defer; a direct
+     * BrightScript assignment always dispatches synchronously (Roku's set-then-read-back
+     * semantics). Stashed to 0 while an observer callback executes (`invoke`), so a handler
+     * dispatched from inside an engine emission still has its own direct assignments treated as
+     * app-initiated; a nested engine site re-enters and is again marked internal.
+     */
+    private static internalUpdateDepth = 0;
+    /**
+     * >0 while a component's `init()` is running (the `init` hierarchy walk in `initializeNode`).
+     * Focus emissions raised during `init` must defer until the OUTERMOST init unwinds — on Roku a
+     * `setFocus(true)` in `init()` dispatches its `focusedChild` observers from the message loop
+     * after `init` returns, so an observer registered LATER in the same `init` still catches it.
+     * Nests: a component's `init` can create/append child components (their own `init` runs
+     * reentrantly), so the queue drains only when this returns to 0.
+     */
+    private static initDepth = 0;
+    /**
+     * >0 while `Node.setNodeFocus`/`restoreFocusChainOnAttach` is writing `focusedChild` down the
+     * ancestor chain. Combined with `initDepth`, this defers ONLY the init-time focus notifications;
+     * a focus change outside `init` (normal navigation, or reentrant from inside an observer) is
+     * unaffected and still dispatches synchronously.
+     */
+    private static focusEmissionDepth = 0;
+    /**
+     * True while draining the deferred queue. Deferral happens only ONCE, at the boundary of the
+     * original top-level handler; once we start draining, the reentrant cascade runs synchronously
+     * (nested, with the normal per-field `notifying` stack) — the pre-existing behavior that
+     * terminates same-field and cross-field observer cascades. Without this, flattening the nested
+     * dispatch into a FIFO loses the guard nesting and two alwaysNotify fields whose observers write
+     * each other (a manual field-alias ping-pong) loop forever.
+     */
+    private static draining = false;
+    /** Deferred reentrant observer invocations, drained at the outermost unwind. */
+    private static readonly deferredQueue: { field: Field; callback: BrsCallback; event: RoSGNodeEvent }[] = [];
+    /**
+     * Fields whose focus-chain notification was raised during a component's init() and deferred.
+     * The observer that reacts is often registered LATER in the same init (after the setFocus call),
+     * so we can't queue a specific callback at emission time — instead we remember the FIELD and
+     * re-run notifyObservers() at the outermost init unwind, reading whatever observers exist by then
+     * (matching Roku dispatching focus notifications from the message loop after init returns).
+     * A Set coalesces repeated writes to one final notification per field, in insertion order.
+     */
+    private static readonly pendingInitFocusFields = new Set<Field>();
+
+    /** Marks entry into a ContentNode parentField cascade, so its observers dispatch inline. */
+    static enterParentCascade() {
+        Field.parentCascadeDepth++;
+    }
+
+    /** Marks exit from a ContentNode parentField cascade. */
+    static exitParentCascade() {
+        Field.parentCascadeDepth--;
+    }
+
+    /** Marks entry into an engine-initiated field emission (message-loop dispatch on Roku). */
+    static enterInternalUpdate() {
+        Field.internalUpdateDepth++;
+    }
+
+    /** Marks exit from an engine-initiated field emission. */
+    static exitInternalUpdate() {
+        Field.internalUpdateDepth--;
+    }
+
+    /** Marks entry into a component's `init()` (the init hierarchy walk). */
+    static enterInit() {
+        Field.initDepth++;
+    }
+
+    /** Marks exit from a component's `init()`. The pending focus notifications are NOT dispatched
+     * here — they are delivered from the next message-loop iteration (see deliverPendingInitFocus),
+     * matching Roku, where a `setFocus` in init() fires its observers from the message loop after
+     * init returns rather than synchronously at the end of init. */
+    static exitInit() {
+        Field.initDepth--;
+    }
+
+    /**
+     * Delivers focus notifications deferred during init(), from the message loop (the extension
+     * `tick` hook) once the outermost init has fully unwound. Called on every tick; it is a cheap
+     * no-op unless there is pending work and it is safe to dispatch (not mid-init, not inside another
+     * observer, not already draining).
+     */
+    static deliverPendingInitFocus() {
+        if (
+            Field.pendingInitFocusFields.size > 0 &&
+            Field.initDepth === 0 &&
+            Field.observerDepth === 0 &&
+            !Field.draining
+        ) {
+            Field.drainInitFocus();
+        }
+    }
+
+    /**
+     * Re-notifies the fields whose focus-chain notification was deferred during init(). Runs each
+     * field's observers synchronously (they were never dispatched during init), draining in
+     * insertion order and picking up any fields a handler defers in turn, until quiescent.
+     */
+    private static drainInitFocus() {
+        let guard = 0;
+        // notifyObservers() consumes each field from the set as it dispatches (see the delete there),
+        // so an inline re-focus of a still-pending ancestor won't be dispatched twice. We still pop
+        // here to guarantee loop progress (e.g. if a field's dispatch is suppressed by `notifying`).
+        for (const field of Field.pendingInitFocusFields) {
+            if (++guard > 100000) {
+                BrsDevice.stderr.write("error,[sg] init focus drain exceeded limit; possible observer loop");
+                Field.pendingInitFocusFields.clear();
+                break;
+            }
+            Field.pendingInitFocusFields.delete(field);
+            field.notifyObservers();
+        }
+    }
+
+    /** Marks entry into a focus-chain emission (`focusedChild` writes in setNodeFocus/attach). */
+    static enterFocusEmission() {
+        Field.focusEmissionDepth++;
+    }
+
+    /** Marks exit from a focus-chain emission. */
+    static exitFocusEmission() {
+        Field.focusEmissionDepth--;
+    }
+
+    /** Resets deferred-dispatch state between app runs so nothing leaks across setups. */
+    static resetDispatch() {
+        Field.observerDepth = 0;
+        Field.parentCascadeDepth = 0;
+        Field.internalUpdateDepth = 0;
+        Field.initDepth = 0;
+        Field.focusEmissionDepth = 0;
+        Field.draining = false;
+        Field.deferredQueue.length = 0;
+        Field.pendingInitFocusFields.clear();
+    }
 
     constructor(
         private readonly name: string = "",
@@ -91,6 +249,31 @@ export class Field {
 
     getName(): string {
         return this.name;
+    }
+
+    /**
+     * Node this field belongs to, recorded the first time the owning node writes it.
+     *
+     * A `Field` is otherwise anonymous — it knows its name and value but not who holds it — which
+     * is fine for local notification (the observer callbacks carry the node) but not for
+     * cross-thread delivery, where the fan-out needs the owner's `syncType` and address. See
+     * `ContentNode.notifyParentFields`, the one notification path that starts from a field rather
+     * than from a node.
+     */
+    private container?: Node;
+
+    /**
+     * Records the node that holds this field. First writer wins, so a field shared through an
+     * alias keeps the node that originally defined it.
+     * @param node Node holding this field.
+     */
+    setContainer(node: Node) {
+        this.container ??= node;
+    }
+
+    /** Returns the node holding this field, when known. */
+    getContainer(): Node | undefined {
+        return this.container;
     }
 
     getType(): FieldKind {
@@ -145,6 +328,19 @@ export class Field {
         if (this.notifying) {
             return;
         }
+        // Focus-chain notification raised during a component's init(): defer to the outermost init
+        // unwind and re-notify then, reading observers registered later in the same init. Recording
+        // the FIELD (not a callback) is what lets an observer added AFTER the setFocus call still
+        // fire — see pendingInitFocusFields / drainInitFocus. Skipped while draining.
+        if (Field.focusEmissionDepth > 0 && Field.initDepth > 0 && !Field.draining) {
+            Field.pendingInitFocusFields.add(this);
+            return;
+        }
+        // We are dispatching this field now, so consume any owed init-focus notification for it:
+        // if a drain is in progress and an earlier field's observer re-focused this one (an inline
+        // dispatch, since initDepth is 0 during delivery), removing it here stops drainInitFocus
+        // from dispatching the same field a second time.
+        Field.pendingInitFocusFields.delete(this);
         this.notifying = true;
         try {
             this.dispatchObservers();
@@ -315,11 +511,62 @@ export class Field {
         );
     }
 
+    /**
+     * Whether `scope` observes this field through a port.
+     *
+     * The `hostNode` match matters: an unscoped observer used to answer true for *every* scope, so
+     * callers picking cross-thread fan-out targets delivered each update to every active task. The
+     * node that registered the observer is recorded on the callback, so attribution is exact — and
+     * for a Task that registered in `init()` (on the render thread, never via rendezvous) this is the
+     * only record that it is waiting.
+     * @param scope Node to test for port observation.
+     */
     isPortObserved(scope: Node) {
         return (
-            (this.unscopedObservers?.some((callback) => callback.observer instanceof RoMessagePort) ?? false) ||
+            (this.unscopedObservers?.some(
+                (callback) => callback.observer instanceof RoMessagePort && callback.hostNode === scope
+            ) ??
+                false) ||
             (this.scopedObservers?.get(scope)?.some((callback) => callback.observer instanceof RoMessagePort) ?? false)
         );
+    }
+
+    /**
+     * Task threads that observe this field through an `roMessagePort`.
+     *
+     * A port cannot cross a thread boundary: `observeField(field, port)` from a task rendezvouses
+     * the call here and the port is rebuilt as a fresh, empty one, while the task's real port is
+     * registered only on its own copy. So the render side cannot tell *which* thread is waiting by
+     * looking at its observer list — and `isPortObserved` answers true for any scope once a single
+     * unscoped port observer exists, which would broadcast every update to every task. Recording
+     * the originating thread id makes the fan-out exact.
+     */
+    private remotePortObservers?: Set<number>;
+
+    /**
+     * Registers a task thread as a port observer of this field.
+     * @param threadId Task thread that called observeField with a port.
+     */
+    addRemotePortObserver(threadId: number) {
+        this.hidden = false;
+        this.remotePortObservers ??= new Set();
+        this.remotePortObservers.add(threadId);
+    }
+
+    /**
+     * Removes a task thread's port observation of this field.
+     * @param threadId Task thread that called unobserveField.
+     */
+    removeRemotePortObserver(threadId: number) {
+        this.remotePortObservers?.delete(threadId);
+    }
+
+    /**
+     * Checks whether a task thread observes this field through a port.
+     * @param threadId Task thread to test.
+     */
+    hasRemotePortObserver(threadId: number) {
+        return this.remotePortObservers?.has(threadId) ?? false;
     }
 
     private convertValue(value: BrsType) {
@@ -351,9 +598,10 @@ export class Field {
             value = new RoArray([value]);
         } else if (
             value instanceof RoArray &&
+            // ColorArray is deliberately absent: it is handled below by convertColorArray, which
+            // also resolves hex-string elements. Listing it here would shadow that branch.
             (this.type === FieldKind.FloatArray ||
                 this.type === FieldKind.IntArray ||
-                this.type === FieldKind.ColorArray ||
                 this.type === FieldKind.TimeArray)
         ) {
             value = this.convertNumericArray(value);
@@ -363,6 +611,8 @@ export class Field {
             value = this.convertVector2D(value);
         } else if (this.type === FieldKind.Vector2DArray) {
             value = this.convertVector2DArray(value);
+        } else if (this.type === FieldKind.ColorArray && value instanceof RoArray) {
+            value = this.convertColorArray(value);
         } else if (this.type === FieldKind.String && isStringComp(value)) {
             value = new BrsString(value.getValue());
         }
@@ -395,9 +645,11 @@ export class Field {
     }
 
     // Coerce each element of an array-typed field to the device element type: FloatArray -> Float,
-    // TimeArray -> Double, Int/ColorArray -> Int32. Without this an integer-valued input array (e.g.
+    // TimeArray -> Double, IntArray -> Int32. Without this an integer-valued input array (e.g.
     // itemSpacings = [12, 6, -16]) keeps Int32 elements, diverging from the device where the elements
     // read back as Float. Non-numeric elements are left untouched.
+    // ColorArray is NOT routed here — convertColorArray owns it, because it additionally resolves
+    // hex-string elements. Keep the two branches disjoint.
     private convertNumericArray(value: RoArray): RoArray {
         const elements = value.elements.map((el: any) => {
             if (!isAnyNumber(el)) {
@@ -488,6 +740,32 @@ export class Field {
         return vector2DArray;
     }
 
+    /**
+     * Normalizes a `colorarray` so every element is stored as a packed `0xRRGGBBAA` integer.
+     *
+     * BrightScript apps routinely build color lists as hex STRINGS (e.g. an interpolator's
+     * `keyValue = [colorBlack + alpha60, colorBackgroundPrimary]`). Without this conversion the
+     * strings were stored verbatim, and consumers that do bitwise math on them (e.g.
+     * ColorFieldInterpolator's HSV blend, ArrayGrid.resolveColor) relied on JS `ToNumber`
+     * coercion instead: a 6-digit `"0x0D1117"` became `0x000D1117`, shifting every lane one byte
+     * right so the intended blue became the alpha (0x17, ~9% opaque) and the color was drawn
+     * nearly invisible. `convertHexColor` applies the implicit `FF` alpha a device assumes for a
+     * 6-digit color, and accepts the `#`/`0x`/`&h` prefixes interchangeably — matching the scalar
+     * `color` path (Group.setValue) and the XML attribute path (NodeFactory.parseColorArray).
+     */
+    private convertColorArray(value: RoArray): RoArray {
+        const colors: BrsType[] = [];
+        for (const element of value.elements) {
+            if (isBrsString(element)) {
+                colors.push(new Int32(convertHexColor(element.getValue())).box());
+            } else if (isAnyNumber(element)) {
+                const number = isBoxedNumber(element) ? element.unbox() : element;
+                colors.push(new Int32(number.getValue()).box());
+            }
+        }
+        return new RoArray(colors);
+    }
+
     private isEqual(oldValue: BrsType, newValue: BrsType): boolean {
         if (isAnyNumber(oldValue) && isAnyNumber(newValue)) {
             return oldValue.getValue() === newValue.getValue();
@@ -509,8 +787,50 @@ export class Field {
             // Prevent stack overflow by not re-entering a running callback
             return;
         }
-        const { interpreter, observer, hostNode, environment, eventParams } = callback;
+        // Snapshot the event (value + info fields) at notification time, matching the RoMessagePort
+        // branch which also builds the event before deferring via pushMessage.
+        const event = this.buildEvent(callback);
 
+        if (callback.observer instanceof RoMessagePort) {
+            callback.observer.pushMessage(event);
+            return;
+        }
+
+        // Roku-accurate deferral: if this notification comes from an engine-initiated emission
+        // (grid focus bookkeeping — a direct BrightScript assignment never defers), another
+        // Callable observer is already executing (reentrant), and it is not part of a ContentNode
+        // parentField cascade, queue it and let the outermost dispatch drain it after the current
+        // handler returns.
+        // Defer only while inside the ORIGINAL top-level handler (not while draining). Once draining,
+        // the cascade runs synchronously/nested so the per-field `notifying` guards terminate it.
+        if (
+            Field.internalUpdateDepth > 0 &&
+            Field.observerDepth > 0 &&
+            !Field.draining &&
+            Field.parentCascadeDepth === 0
+        ) {
+            Field.deferredQueue.push({ field: this, callback, event });
+            return;
+        }
+
+        Field.observerDepth++;
+        try {
+            this.invoke(callback, event);
+            if (Field.observerDepth === 1 && !Field.draining) {
+                Field.drainDeferred();
+            }
+        } finally {
+            Field.observerDepth--;
+            if (Field.observerDepth === 0) {
+                // Safety: on an exception unwinding through the drain, don't leave stale work queued.
+                Field.deferredQueue.length = 0;
+            }
+        }
+    }
+
+    /** Builds the event delivered to an observer, snapshotting the field value and info fields. */
+    private buildEvent(callback: BrsCallback): RoSGNodeEvent {
+        const { eventParams } = callback;
         // Get info fields current value, if exists.
         let infoFields: RoAssociativeArray | undefined;
         if (eventParams.infoFields) {
@@ -526,20 +846,103 @@ export class Field {
             infoFields = toAssociativeArray(fieldsMap);
         }
         // Every time a callback happens, a new event is created.
-        const event = new RoSGNodeEvent(eventParams.node, eventParams.fieldName, this.value, infoFields);
+        return new RoSGNodeEvent(eventParams.node, eventParams.fieldName, this.value, infoFields);
+    }
 
-        if (observer instanceof RoMessagePort) {
-            observer.pushMessage(event);
+    /**
+     * Drains deferred reentrant observer invocations FIFO. `observerDepth` stays at 1 for the whole
+     * drain, so a callback that itself triggers a reentrant notification re-enqueues and is picked
+     * up by the loop — iterating until quiescent, in the order the fields changed.
+     */
+    private static drainDeferred() {
+        Field.draining = true;
+        try {
+            let guard = 0;
+            while (Field.deferredQueue.length > 0) {
+                if (++guard > 100000) {
+                    BrsDevice.stderr.write("error,[sg] observer drain exceeded limit; possible observer loop");
+                    Field.deferredQueue.length = 0;
+                    break;
+                }
+                const deferred = Field.deferredQueue.shift()!;
+                const field = deferred.field;
+                // Run the deferred callback synchronously (nested): while it executes, hold the
+                // field's `notifying` guard and count it in `observerDepth`, so any notifications it
+                // triggers dispatch inline with the normal per-field guard stack. This mirrors what
+                // the original synchronous dispatch did before the handler-boundary deferral, and is
+                // what terminates same-field self-writes and cross-field alias ping-pongs.
+                const wasNotifying = field.notifying;
+                field.notifying = true;
+                Field.observerDepth++;
+                try {
+                    field.invoke(deferred.callback, deferred.event);
+                } finally {
+                    Field.observerDepth--;
+                    field.notifying = wasNotifying;
+                }
+            }
+        } finally {
+            Field.draining = false;
+        }
+    }
+
+    /** Runs a single Callable observer callback with the caller's host node / m scope restored. */
+    private invoke(callback: BrsCallback, event: RoSGNodeEvent) {
+        if (!(callback.observer instanceof Callable)) {
             return;
         }
+        // While the handler's BrightScript executes, its direct field assignments are
+        // app-initiated even when this dispatch happens inside an engine emission site (e.g. a
+        // panel callback fired from ArrayGrid.setFocusedItem, or a focus-chain write). Stash the
+        // internal-update and focus-emission markers and restore them after; a nested engine site
+        // re-enters them on its own.
+        const stashedInternalDepth = Field.internalUpdateDepth;
+        const stashedFocusDepth = Field.focusEmissionDepth;
+        Field.internalUpdateDepth = 0;
+        Field.focusEmissionDepth = 0;
+        try {
+            this.invokeCallable(callback, event);
+        } finally {
+            Field.internalUpdateDepth = stashedInternalDepth;
+            Field.focusEmissionDepth = stashedFocusDepth;
+        }
+    }
 
+    /**
+     * Decides whether an observer callback receives the event as its argument.
+     *
+     * Device-measured on Roku OS 15.2: an observer registered by name is invoked with the event
+     * ONLY when it declares exactly ONE parameter whose declared type accepts an object. There is
+     * no coercion, and no partial binding — a callback declaring more than one parameter never
+     * receives the event, even when the extra parameters are optional and the first one is
+     * `as object`. A default on the single parameter is irrelevant: it still receives the event.
+     *
+     * When this returns undefined the caller falls back to a zero-argument call, which succeeds
+     * only when no parameter is required; otherwise the callback is not invoked at all (silently,
+     * as on device).
+     *
+     * @param observer the callable registered as the observer
+     * @param event the event to be delivered
+     * @returns the satisfied signature when the event is to be passed, otherwise undefined
+     */
+    private static satisfiedByEvent(observer: Callable, event: RoSGNodeEvent) {
+        return observer
+            .getAllSignatureMismatches([event])
+            .find((satisfaction) => satisfaction.mismatches.length === 0 && satisfaction.signature.args.length === 1);
+    }
+
+    private invokeCallable(callback: BrsCallback, event: RoSGNodeEvent) {
+        const { interpreter, observer, hostNode, environment } = callback;
+        if (!(observer instanceof Callable)) {
+            return;
+        }
         interpreter.inSubEnv((subInterpreter) => {
             callback.running = true;
             subInterpreter.environment.hostNode = hostNode;
             subInterpreter.environment.setRootM(hostNode.m);
             // Check whether the callback is expecting an event parameter.
-            const satisfiedSignature =
-                observer.getFirstSatisfiedSignature([event]) ?? observer.getFirstSatisfiedSignature([]);
+            const eventSatisfaction = Field.satisfiedByEvent(observer, event);
+            const satisfiedSignature = eventSatisfaction ?? observer.getFirstSatisfiedSignature([]);
             if (satisfiedSignature) {
                 const { signature, impl } = satisfiedSignature;
                 const originalLocation = interpreter.location;
@@ -551,25 +954,18 @@ export class Field {
                     signature: satisfiedSignature.signature,
                 });
                 try {
-                    if (signature.args.length > 0) {
-                        // Roku invokes an observer callback with only the event as its first
-                        // argument; any remaining declared parameters fall back to their default
-                        // values. Bind them all here — previously only the first parameter was
-                        // defined, leaving later ones <uninitialized> (e.g. a timer `fire`
-                        // callback declared as `sub cb(event, opt = true)` crashed reading `opt`).
-                        for (const [index, param] of signature.args.entries()) {
-                            let paramValue: BrsType;
-                            if (index === 0) {
-                                paramValue = event;
-                            } else if (param.defaultValue) {
-                                paramValue = subInterpreter.evaluate(param.defaultValue);
-                            } else {
-                                paramValue = Uninitialized.Instance;
-                            }
-                            subInterpreter.environment.define(Scope.Function, param.name.text, paramValue);
-                        }
+                    if (eventSatisfaction) {
+                        // The event is bound to the single declared parameter (see `satisfiedByEvent`).
+                        subInterpreter.environment.define(Scope.Function, signature.args[0].name.text, event);
                         impl(subInterpreter, event);
                     } else {
+                        // The event was not passed, so every declared parameter takes its default.
+                        for (const param of signature.args) {
+                            const paramValue: BrsType = param.defaultValue
+                                ? subInterpreter.evaluate(param.defaultValue)
+                                : Uninitialized.Instance;
+                            subInterpreter.environment.define(Scope.Function, param.name.text, paramValue);
+                        }
                         impl(subInterpreter);
                     }
                     interpreter.popFromStack();

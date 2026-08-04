@@ -17,6 +17,12 @@ import fileType from "file-type";
 import { XMLHttpRequest } from "../../polyfill/XMLHttpRequest";
 /// #endif
 
+/** Percent-encodes a string per RFC 3986, closing the gap left by `encodeURIComponent()`
+ *  (which leaves `!'()*` unescaped for legacy `escape()` compatibility). */
+function encodeUriComponentStrict(text: string): string {
+    return encodeURIComponent(text).replaceAll(/[!'()*]/g, (c) => "%" + c.codePointAt(0)!.toString(16).toUpperCase());
+}
+
 interface RequestOptions {
     method: string;
     responseType: XMLHttpRequestResponseType;
@@ -277,7 +283,11 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
 
     postFromStringAsync(): BrsType {
         const request = this.postBody.shift();
-        if (!request) {
+        // An empty string is a valid POST body (e.g. token requests that carry auth in headers
+        // only), so guard on an empty queue (undefined) rather than falsiness — otherwise the
+        // async request is silently dropped, no roUrlEvent is posted, and the caller's
+        // waitMessage() blocks until timeout.
+        if (request === undefined) {
             return BrsInvalid.Instance;
         }
         return this.postFromStringEvent(request);
@@ -670,7 +680,7 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
             returns: ValueKind.String,
         },
         impl: (_: Interpreter, text: BrsString) => {
-            return new BrsString(encodeURI(text.value));
+            return new BrsString(encodeUriComponentStrict(text.value));
         },
     });
 
@@ -681,7 +691,7 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
             returns: ValueKind.String,
         },
         impl: (_: Interpreter, text: BrsString) => {
-            return new BrsString(encodeURI(text.value));
+            return new BrsString(encodeUriComponentStrict(text.value));
         },
     });
 
@@ -692,7 +702,7 @@ export class RoURLTransfer extends BrsComponent implements BrsValue, BrsHttpAgen
             returns: ValueKind.String,
         },
         impl: (_: Interpreter, text: BrsString) => {
-            return new BrsString(decodeURI(text.value));
+            return new BrsString(decodeURIComponent(text.value));
         },
     });
 

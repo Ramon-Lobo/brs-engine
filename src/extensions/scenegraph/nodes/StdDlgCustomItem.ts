@@ -46,8 +46,9 @@ export class StdDlgCustomItem extends Group implements StdDlgItem {
                 continue;
             }
             const trans = (child.getValueJS("translation") as number[]) ?? [0, 0];
-            let childHeight =
-                child instanceof Label ? child.getMeasured().height : (child.getValueJS("height") as number);
+            // getDimensions(), not the raw height field: a LayoutGroup has no width/height fields on
+            // a real device (see LayoutGroup.layoutHeight) and reports its measured size only here.
+            let childHeight = child instanceof Label ? child.getMeasured().height : child.getDimensions().height;
             // Not `childHeight <= 0`: childHeight can be NaN (unmeasured child), which must also fall
             // back to bitmapHeight. `!(childHeight > 0)` is true for NaN, whereas `NaN <= 0` is false.
             if (!(childHeight > 0)) {
@@ -70,8 +71,14 @@ export class StdDlgCustomItem extends Group implements StdDlgItem {
         return height;
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
-        super.renderNode(interpreter, origin, angle, opacity, draw2D);
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
+        super.renderNodeContent(interpreter, origin, angle, opacity, draw2D);
         // Children (e.g. a LayoutGroup) only know their size after rendering. If that changed the
         // content height from what layout assumed, ask the owning dialog to re-lay-out next frame so
         // the following areas (buttons) are positioned below this item rather than overlapping it.

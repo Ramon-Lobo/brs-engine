@@ -389,15 +389,20 @@ describe("Standard Dialog Framework nodes", () => {
             const keyboard = findDescendant(dialog, "DynamicKeyboard");
             expect(keyboard).toBeDefined();
 
-            // The Dynamic key grid resolves its glyph/focus colors from a palette node bridged from
-            // the dialog's Dialog* colors, so it themes consistently with the button row.
+            // The dialog bridges its Dialog* colors onto a palette node attached to the keyboard
+            // widget; both the key grid and the text box resolve their colors from it (walking up),
+            // so the whole keyboard themes consistently with the button row.
             const keyGrid = keyboard.getValue("keyGrid");
-            const keyColors = keyGrid.getValue("palette").getValueJS("colors");
+            const keyColors = keyboard.getValue("palette").getValueJS("colors");
 
             // Key glyphs and unfocused button text both use DialogTextColor.
             const textColor = keyColors.PrimaryTextColor;
             expect(textColor).not.toBe(WHITE);
             expect(buttonArea.getValueJS("textColor")).toBe(textColor);
+            // The key grid inherits the widget palette via its ancestor walk...
+            expect(keyGrid.resolvePaletteColor("PrimaryTextColor", WHITE)).toBe(textColor);
+            // ...and the keyboard's typed-text color is themed from the same DialogTextColor.
+            expect(keyboard.textEditBox.getValueJS("textColor")).toBe(textColor);
             // Focused button background uses DialogFocusColor; focused text uses DialogFocusItemColor.
             expect(buttonArea.getValueJS("focusBitmapBlendColor")).not.toBe(WHITE);
             expect(buttonArea.getValueJS("focusBitmapBlendColor")).not.toBe(textColor);
@@ -802,10 +807,14 @@ describe("Standard Dialog Framework nodes", () => {
             dialog.renderNode(fakeInterpreter, [0, 0], 0, 1, draw2D);
             dialog.renderNode(fakeInterpreter, [0, 0], 0, 1, draw2D);
 
-            const listHeight = list.getValueJS("height");
+            // getDimensions(), not getValueJS("height"): a LayoutGroup exposes no width/height FIELDS
+            // on a real device (hasField("width") is false, lg.width reads invalid — device-measured
+            // in Samples/layoutspacing-probe), so its measured size is only readable this way.
+            const listHeight = list.getDimensions().height;
             // The LayoutGroup reports its stacked size (3 rows + 2 gaps), and the custom item wraps it.
             expect(listHeight).toBeGreaterThan(0);
             expect(custom.getValueJS("height")).toBe(listHeight);
+            expect(list.hasNodeField("width")).toBe(false);
             // The button row sits below the custom item's content, not overlapping it.
             const buttonTop = buttonArea.getValueJS("translation")[1];
             const customBottom = custom.getValueJS("translation")[1] + custom.getValueJS("height");

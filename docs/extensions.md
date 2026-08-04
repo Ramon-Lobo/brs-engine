@@ -25,6 +25,10 @@ class MyExtension implements BrsExtension {
 registerExtension(() => new MyExtension());
 ```
 
+> [!IMPORTANT]
+>
+> `registerExtension` lives in the **interpreter** bundle, not in the browser API bundle. It is exported at runtime by `brs-node` (and by `brs.worker.js`), but **not** by `brs-engine`'s `lib/brs.api.js`, which runs on the main thread. In the browser, an extension is therefore never registered from the page — declare it in `DeviceInfo.extensions` and let the worker load it, as described below.
+
 ## SceneGraph extension (`brs-scenegraph`)
 
 The SceneGraph runtime ships as a standalone extension located under `packages/scenegraph`. It owns the XML component parser, `RoSGScreen`, nodes, and task execution helpers.
@@ -54,21 +58,29 @@ No extra glue code is required as long as `brs-sg.js` is served next to the work
 
 ### Node.js and CLI
 
-- The `brs-node` CLI registers the SceneGraph extension by default. Pass `--no-sg` to skip loading it.
-- When embedding the Node.js library you can register the extension yourself:
+- The `brs-node` CLI registers the SceneGraph extension by default (from the `brs-sg.node.js` bundle shipped in its `bin/` folder). Pass `--no-sg` to skip loading it.
+- When embedding the Node.js library, the registration path depends on the execution model:
+  - **Synchronous `executeFile`** — register the extension in-process before running:
 
-```ts
-import { registerExtension } from "brs-engine";
-import { BrightScriptExtension } from "brs-scenegraph";
+    ```ts
+    import { registerExtension } from "brs-node";
+    const { BrightScriptExtension } = require("brs-node/bin/brs-sg.node.js");
 
-registerExtension(() => new BrightScriptExtension());
-```
+    registerExtension(() => new BrightScriptExtension());
+    ```
 
-Once registered, every interpreter you create (via `createPayloadFromFiles`, CLI runs, tests, etc.) will run SceneGraph components.
+  - **Worker-based `executeApp`** — declare it on the payload instead; each worker thread is a fresh isolate and loads its own instance (paths resolve against `bin/`):
+
+    ```ts
+    payload.extensions = [SupportedExtension.SceneGraph];
+    payload.device.extensions = new Map([[SupportedExtension.SceneGraph, "brs-sg.node.js"]]);
+    ```
+
+See the [Node.js library guide](./using-node-library.md) for the full comparison of the two models.
 
 ### Common volume assets
 
-SceneGraph needs fonts, locale tables, and imagery that do not ship with the core interpreter. During `npm run build` or `npm run release` inside `packages/scenegraph` so this package's assets build step runs:
+SceneGraph needs fonts, locale tables, and imagery that do not ship with the core interpreter. Run `npm run build` (or `npm run release`) inside `packages/scenegraph` so this package's assets build step runs. It will:
 
 - Copy the base assets from `src/core/common` and merge them with the extension overrides under `src/extensions/scenegraph/common` (extension files win on name collisions).
 - Zip the merged tree to `packages/scenegraph/assets/common.zip`, which mirrors Roku's `common:/` volume.

@@ -4,7 +4,6 @@ import { AAMember, Interpreter, BrsDevice, BrsString, Int32, IfDraw2D, Rect, Rec
 import { ArrayGrid, FocusStyle } from "./ArrayGrid";
 import { ContentNode } from "./ContentNode";
 import { customNodeExists } from "../factory/NodeFactory";
-import { jsValueOf } from "../factory/Serializer";
 
 export class MarkupGrid extends ArrayGrid {
     readonly defaultFields: FieldModel[] = [
@@ -18,6 +17,9 @@ export class MarkupGrid extends ArrayGrid {
     protected readonly marginX: number;
     protected readonly marginY: number;
     protected readonly gap: number;
+    // Leftmost rendered column — a single shared horizontal window: a grid scrolls all its rows
+    // together on a device (unlike RowList, which keeps a per-row scroll offset).
+    protected scrollCol = 0;
     private itemComponentErrorLogged = false;
 
     constructor(initializedFields: AAMember[] = [], readonly name: string = SGNodeType.MarkupGrid) {
@@ -37,12 +39,28 @@ export class MarkupGrid extends ArrayGrid {
         this.gap = 0;
         this.setValueSilent("focusBitmapUri", new BrsString(this.focusUri));
         this.setValueSilent("wrapDividerBitmapUri", new BrsString(this.dividerUri));
-        const style = this.getValueJS("vertFocusAnimationStyle") as string;
-        this.wrap = style.toLowerCase() === FocusStyle.FixedFocusWrap.toLowerCase();
+        this.applyVertFocusStyle();
+        this.applyHorizFocusStyle();
         this.numRows = this.getValueJS("numRows") as number;
         this.numCols = this.getValueJS("numColumns") as number;
         this.hasNinePatch = true;
         this.focusField = "gridHasFocus";
+    }
+
+    /**
+     * A real device reports a MarkupGrid's bounding rect as exactly the laid-out item extent
+     * (rows/columns of itemSize plus spacing) with NO focus-bitmap outset: apps size sibling
+     * backgrounds from boundingRect() and on device they align flush with the items. The
+     * marginX/marginY outset still drives the drawn focus frame (focusMargins), just not the
+     * reported rects.
+     */
+    protected rectMargins(): { x: number; y: number } {
+        return { x: 0, y: 0 };
+    }
+
+    /** A grid lays its columns out from columnWidths/columnSpacings; per the reference, lists do not. */
+    protected usesColumnWidths(): boolean {
+        return true;
     }
 
     protected handleUpDown(key: string) {
@@ -72,7 +90,10 @@ export class MarkupGrid extends ArrayGrid {
                 }
             }
         }
-        if (nextIndex >= 0 && nextIndex < this.content.length) {
+        // A wrap on a single content row resolves to the focused index itself: the move is a
+        // no-op and must NOT report handled, so the key bubbles to an ancestor's onKeyEvent
+        // (e.g. a screen moving focus from a one-row related-items grid back to a menu above).
+        if (nextIndex >= 0 && nextIndex < this.content.length && nextIndex !== this.focusIndex) {
             const itemIndex = this.metadata[nextIndex]?.index ?? nextIndex;
             this.setValue("animateToItem", new Int32(itemIndex));
             handled = true;
@@ -85,22 +106,70 @@ export class MarkupGrid extends ArrayGrid {
         return this.handleUpDown(key);
     }
 
-    protected handleLeftRight(key: string) {
-        let handled = false;
-        const offset = key === "left" ? -1 : 1;
-        const nextIndex = this.focusIndex + offset;
-        if (nextIndex >= 0 && nextIndex < this.content.length && this.itemComps?.[nextIndex]) {
-            const numCols = jsValueOf(this.getValue("numColumns")) as number;
-            const currentRow = Math.floor(this.focusIndex / numCols);
-            const nextRow = Math.floor(nextIndex / numCols);
-            const item = this.itemComps[nextIndex];
-            if (currentRow === nextRow && item.nodeSubtype !== "Group") {
-                const itemIndex = this.metadata[nextIndex]?.index ?? nextIndex;
-                this.setValue("animateToItem", new Int32(itemIndex));
-                handled = true;
-            }
+    /** Columns that fit fully on screen; falls back to numCols when the pitch is degenerate. */
+    private maxVisibleColumns(): number {
+        const itemSize = this.getValueJS("itemSize") as number[];
+        const spacing = this.getValueJS("itemSpacing") as number[];
+        const pitch = (itemSize?.[0] ?? 0) + (spacing?.[0] ?? 0);
+        if (pitch <= 0) {
+            return Math.max(1, this.numCols);
         }
-        return handled;
+        // Like RowList's floating-focus math, the viewport is the scene width. Limitation: a grid
+        // translated right of x=0 (or with itemClippingRect) can overestimate by up to a column.
+        return Math.max(1, Math.floor(this.sceneRect.width / pitch));
+    }
+
+    protected updateHorizScroll(index: number) {
+        const numCols = Math.max(1, this.numCols || 1);
+        const col = index % numCols;
+        if (this.horizFocusAnimationStyleName === FocusStyle.FixedFocus.toLowerCase()) {
+            // fixedFocus: the focused column is pinned at the grid's left edge.
+            this.scrollCol = col;
+            return;
+        }
+        // floatingFocus, and fixedFocusWrap — horizontal wrapping is not implemented yet (the
+        // documented pair is fixedFocusWrap + focusColumn); it floats like a row with too few
+        // items would on a device: minimal scroll keeping the focused column fully visible.
+        const maxVisible = this.maxVisibleColumns();
+        const maxScroll = Math.max(0, numCols - maxVisible);
+        if (col < this.scrollCol) {
+            this.scrollCol = col;
+        } else if (col >= this.scrollCol + maxVisible) {
+            this.scrollCol = col - maxVisible + 1;
+        }
+        this.scrollCol = Math.max(0, Math.min(this.scrollCol, maxScroll));
+    }
+
+    protected resetFocusForNewContent(freshContent: boolean) {
+        if (freshContent) {
+            // Covers the unfocused path where ArrayGrid resets the cursor silently without
+            // routing through setFocusedItem/updateHorizScroll.
+            this.scrollCol = 0;
+        }
+        super.resetFocusForNewContent(freshContent);
+    }
+
+    protected handleLeftRight(key: string) {
+        const offset = key === "left" ? -1 : 1;
+        const numCols = Math.max(1, this.numCols || 1);
+        const nextIndex = this.focusIndex + offset;
+        if (nextIndex < 0 || nextIndex >= this.content.length) {
+            // Off either end: bubble to an ancestor's onKeyEvent (no horizontal wrap on device).
+            return false;
+        }
+        if (Math.floor(nextIndex / numCols) !== Math.floor(this.focusIndex / numCols)) {
+            // Left/right never changes rows.
+            return false;
+        }
+        // Placeholder cells pad a section's ragged last row (ArrayGrid.processSection). Check the
+        // content model instead of requiring this.itemComps[nextIndex] to exist — the old rendered-
+        // component check also blocked navigation to any column not yet scrolled on screen.
+        if (this.content[nextIndex]?.name === "_placeholder_") {
+            return false;
+        }
+        const itemIndex = this.metadata[nextIndex]?.index ?? nextIndex;
+        this.setValue("animateToItem", new Int32(itemIndex));
+        return true;
     }
 
     protected renderContent(
@@ -145,7 +214,10 @@ export class MarkupGrid extends ArrayGrid {
             if (rowIndex < 0) {
                 break;
             }
-            itemRect.height = rowHeights[rowIndex / this.numCols] ?? itemSize[1];
+            // Per-row overrides are indexed by ABSOLUTE row, top to bottom — not by the display slot,
+            // which differs as soon as the grid is scrolled.
+            const absoluteRow = Math.floor(rowIndex / this.numCols);
+            itemRect.height = rowHeights[absoluteRow] ?? itemSize[1];
             if (!hasSections && this.wrap && rowIndex < lastIndex && r > 0) {
                 const divRect = { ...itemRect, width: rowWidth };
                 const divHeight = this.renderWrapDivider(divRect, opacity, draw2D);
@@ -157,7 +229,10 @@ export class MarkupGrid extends ArrayGrid {
                 sectionIndex++;
                 itemRect.y += divHeight + spacing[1];
             }
-            for (let c = 0; c < this.numCols; c++) {
+            // Start at the horizontal scroll window's left column (clamped in case numColumns
+            // shrank at runtime) so the focused/visible columns lay out from the grid's left edge.
+            const startCol = Math.min(this.scrollCol, Math.max(0, this.numCols - 1));
+            for (let c = startCol; c < this.numCols; c++) {
                 itemRect.width = columnWidths[c] ?? itemSize[0];
                 const index = rowIndex + c;
                 if (index >= this.content.length) {
@@ -171,11 +246,13 @@ export class MarkupGrid extends ArrayGrid {
                 }
             }
             itemRect.x = rect.x;
-            itemRect.y += itemRect.height + (rowSpacings[r] ?? spacing[1]);
+            itemRect.y += itemRect.height + (rowSpacings[absoluteRow] ?? spacing[1]);
             if (!RectRect(this.sceneRect, itemRect)) {
                 break;
             }
         }
-        this.updateRect(rect, displayRows, itemSize);
+        this.updateRect(rect, displayRows, itemSize, {
+            firstRow: Math.max(0, Math.floor(this.getRenderRowIndex(0) / this.numCols)),
+        });
     }
 }

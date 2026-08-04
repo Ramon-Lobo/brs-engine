@@ -21,7 +21,7 @@ import { ThreadInfo } from "./SGTypes";
 import type { SoundEffect } from "./nodes/SoundEffect";
 import type { RoSGNode } from "./components/RoSGNode";
 import type { RoSGScreen } from "./components/RoSGScreen";
-import type { AnimationBase, Audio, Dialog, Scene, StandardDialog, Task, Timer, Video } from "./nodes";
+import type { AnimationBase, Audio, Dialog, Node, Scene, StandardDialog, Task, Timer, Video } from "./nodes";
 import type { RoRenderThreadQueue } from "./components/RoRenderThreadQueue";
 
 /**
@@ -52,6 +52,8 @@ export class SGRoot {
     private _video?: Video;
     private _dirty: boolean = false;
     private _rendering: boolean = false;
+    private _measuring: boolean = false;
+    private _renderPass: "layout" | "paint" = "paint";
     private readonly _pendingPorts: RoMessagePort[] = [];
     /**
      * When `true`, recently-written fields can be re-read from the local copy for a short window,
@@ -59,11 +61,57 @@ export class SGRoot {
      * field get rendezvouses with the owning thread, matching real Roku device behavior.
      */
     fastFieldReads: boolean = false;
+    /** Fallback for `logRendezvous` before the shared control array is available. */
+    private localLogRendezvous: boolean = false;
+
     /**
      * When `true`, each rendezvous logs its action, target, and duration (mirroring the Roku
      * SceneGraph debug console `logrendezvous` command). Defaults to `false`.
+     *
+     * Backed by the shared control array rather than a per-thread field, because a rendezvous has
+     * two ends: tracing only the thread the flag was set on shows half of each exchange. Sharing it
+     * also makes the toggle live — a host can turn tracing on mid-run and every existing Task thread
+     * picks it up, instead of the value being frozen into each worker's launch payload.
      */
-    logRendezvous: boolean = false;
+    get logRendezvous(): boolean {
+        const shared = BrsDevice.sharedArray;
+        if (shared && shared.length > DataType.RDZ) {
+            return Atomics.load(shared, DataType.RDZ) === 1;
+        }
+        return this.localLogRendezvous;
+    }
+
+    set logRendezvous(enabled: boolean) {
+        this.localLogRendezvous = enabled;
+        const shared = BrsDevice.sharedArray;
+        if (shared && shared.length > DataType.RDZ) {
+            Atomics.store(shared, DataType.RDZ, enabled ? 1 : 0);
+        }
+    }
+    /** Fallback for `rendezvousTracking` before the shared control array is available. */
+    private localRendezvousTracking: boolean = false;
+
+    /**
+     * When `true`, each completed rendezvous is reported as a `RendezvousEvent` for ECP
+     * `query/sgrendezvous` to collect, independent of {@link logRendezvous}. Toggled by
+     * `sgrendezvous/track` and `sgrendezvous/untrack`. Backed by the shared control array for the
+     * same reason as `logRendezvous`: the toggle must be live and visible to every Task thread.
+     */
+    get rendezvousTracking(): boolean {
+        const shared = BrsDevice.sharedArray;
+        if (shared && shared.length > DataType.RDT) {
+            return Atomics.load(shared, DataType.RDT) === 1;
+        }
+        return this.localRendezvousTracking;
+    }
+
+    set rendezvousTracking(enabled: boolean) {
+        this.localRendezvousTracking = enabled;
+        const shared = BrsDevice.sharedArray;
+        if (shared && shared.length > DataType.RDT) {
+            Atomics.store(shared, DataType.RDT, enabled ? 1 : 0);
+        }
+    }
     /**
      * Maximum time (ms) a Task thread will wait for the render thread to serve a rendezvous before
      * treating it as a blocked render thread. On a real device a render-thread block terminates the
@@ -71,8 +119,36 @@ export class SGRoot {
      * `ExecutionTimeout` runtime error instead of silently returning `invalid`. Defaults to 10s.
      */
     rendezvousTimeout: number = 10000;
+    /**
+     * True while the serializer is rebuilding a node from cross-thread data (`toSGNode`). Media nodes
+     * (`Video`/`Audio`) check this in their constructor to skip the render-init that registers them as
+     * the singleton `sgRoot.video`/`sgRoot.audio` and posts player-reset messages — a deserialization
+     * proxy must never hijack the real player instance the app created.
+     */
+    deserializing: boolean = false;
+    /**
+     * Thread id the data currently being rebuilt came from, or -1 outside a cross-thread rebuild.
+     * `toSGNode` uses it to attribute a node's `_observed_` port observations to the thread whose
+     * real port is waiting on them (see `Field.remotePortObservers`); passing it through every
+     * serializer signature would touch a dozen call sites for one narrow need.
+     */
+    deserializingThread: number = -1;
     /** The render thread's roRenderThreadQueue singleton (holds handlers), drained each frame. */
     private _renderQueue?: RoRenderThreadQueue;
+    /**
+     * Nodes that have crossed the thread boundary (serialized to, or rebuilt from, another thread),
+     * keyed by address. A rendezvous update targets a node by this address, and on a real Roku any
+     * node the other thread holds a reference to stays reachable — even when it is no longer part of
+     * the task/scene/global trees (e.g. a per-request callback node that a field stopped pointing
+     * at). WeakRefs keep the registry from retaining nodes; the FinalizationRegistry prunes entries
+     * once a node is collected.
+     */
+    private readonly _crossThreadNodes = new Map<string, WeakRef<Node>>();
+    private readonly _crossThreadCleanup = new FinalizationRegistry((address: string) => {
+        if (this._crossThreadNodes.get(address)?.deref() === undefined) {
+            this._crossThreadNodes.delete(address);
+        }
+    });
 
     get interpreter(): Interpreter | undefined {
         return this._interpreter;
@@ -154,11 +230,51 @@ export class SGRoot {
         this._rendering = value;
     }
 
+    /**
+     * True while a bounding-rect query is measuring a single node's subtree from inside an active
+     * render (see `Node.getBoundingRect`). A nested query raised during that local measurement pass
+     * must return the rects it is computing rather than starting yet another local pass — this flag
+     * bounds that recursion, the same way `rendering` bounds full-scene refreshes.
+     */
+    get measuring(): boolean {
+        return this._measuring;
+    }
+
+    set measuring(value: boolean) {
+        this._measuring = value;
+    }
+
+    /**
+     * Which kind of render pass is currently traversing the tree. A `layout` pass (started by
+     * `Node.layoutNode` — bounding-rect refreshes, `measureUnsizedChildren`) must be idempotent
+     * and clock-free: rects only. A `paint` pass (`Node.paintNode` — the per-frame render) may
+     * additionally advance time-based state and draw. Defaults to `paint` so direct `renderNode`
+     * calls (external node registrations, tests) keep today's semantics. See
+     * `docs/scenegraph-layout-passes.md`.
+     */
+    get renderPass(): "layout" | "paint" {
+        return this._renderPass;
+    }
+
+    set renderPass(value: "layout" | "paint") {
+        this._renderPass = value;
+    }
+
+    /**
+     * True while a full-tree layout refresh may skip settled subtrees (`Node.subtreeStale` false
+     * and unchanged origin/angle/opacity). Enabled only around `refreshLayoutFromRoot`'s pass —
+     * scoped subtree measurements (the mid-render fallback, `measureUnsizedChildren`) never prune.
+     * Sound only because layout passes are pure (see docs/scenegraph-layout-passes.md).
+     */
+    pruneLayout: boolean = false;
+
+    /** Set by BRS_PRUNE_DISABLE: turns pruned layout refreshes off entirely (field debugging). */
+    pruneDisabled: boolean = false;
+
     private audioFlags: number = -1;
     private audioIndex: number = -1;
     private audioDuration: number = -1;
     private audioPosition: number = -1;
-    private videoEvent: number = -1;
     private videoIndex: number = -1;
     private videoProgress: number = -1;
     private videoDuration: number = -1;
@@ -178,6 +294,12 @@ export class SGRoot {
         // Default resolution and auto substitution parameters
         this._resolution = "HD";
         this._autoSub = { search: "", replace: "" };
+        // Pruned-layout escape hatch from the environment (node builds; browsers/tests set the
+        // field programmatically). Runtime-guarded rather than ifdef'd — the same bundle also
+        // loads in Web Workers, where `process` does not exist.
+        if (typeof process !== "undefined" && process.env) {
+            this.pruneDisabled = process.env.BRS_PRUNE_DISABLE === "1";
+        }
     }
 
     /**
@@ -316,6 +438,58 @@ export class SGRoot {
      */
     setFocused(node?: RoSGNode) {
         this._focused = node;
+    }
+
+    /**
+     * Records a node whose address has crossed the thread boundary, so later rendezvous
+     * updates can resolve it even when it is unreachable from the task/scene/global trees.
+     * @param node Node being serialized to (or rebuilt from) another thread
+     */
+    registerCrossThreadNode(node: Node) {
+        const address = node.getAddress();
+        if (this._crossThreadNodes.get(address)?.deref() === node) {
+            return;
+        }
+        this._crossThreadNodes.set(address, new WeakRef(node));
+        this._crossThreadCleanup.register(node, address);
+    }
+
+    /**
+     * Resolves a previously registered cross-thread node by address.
+     * @param address Node address to look up
+     * @returns The live node, or undefined if never registered or already collected
+     */
+    getCrossThreadNode(address: string): Node | undefined {
+        return this._crossThreadNodes.get(address)?.deref();
+    }
+
+    /**
+     * Resolves an address to the instance of that node this thread should actually use.
+     *
+     * Live reachability wins over the cross-thread registry: `toSGNode` copies `_address_` when it
+     * rebuilds a node, so repeated serializations of one logical node mint instances sharing its
+     * address and the registry keeps only the latest. Walking the trees first means a node still
+     * wired into the scene, the global node or a task always resolves to its authoritative copy,
+     * with the registry left as the fallback for a true orphan held only by the other thread.
+     * Mirrors the ordering in `Task.resolveNode` — see the regression it documents.
+     * @param address Node address to resolve.
+     * @returns The live node, or undefined when this thread has no instance for that address.
+     */
+    resolveLiveNode(address: string): Node | undefined {
+        if (!address) {
+            return undefined;
+        }
+        const roots: (Node | undefined)[] = [this._scene, this._mGlobal];
+        for (const thread of this._threads.values()) {
+            roots.push(thread.task);
+        }
+        for (const root of roots) {
+            const found = root?.findNodeByAddress(root, address, true);
+            if (found) {
+                return found;
+            }
+        }
+        return this.getCrossThreadNode(address);
     }
 
     /**
@@ -516,7 +690,6 @@ export class SGRoot {
      */
     setVideo(video: Video) {
         this._video = video;
-        this.videoEvent = -1;
         this.videoIndex = -1;
         this.videoProgress = -1;
         this.videoDuration = -1;
@@ -541,17 +714,41 @@ export class SGRoot {
         }
         let isDirty = false;
         const progress = Atomics.load(BrsDevice.sharedArray, DataType.VLP);
-        if (this.videoProgress !== progress && progress >= 0 && progress <= 1000) {
-            this._video.setState(MediaEvent.Loading, Math.trunc(progress / 10));
+        if (progress >= 0 && progress <= 1000) {
+            // Consume the slot so an identical value published by a LATER load is still seen.
+            // Apps commonly reuse a single Video node across content: nothing resets
+            // `videoProgress` between loads, and a fast (cached) load can climb back to the same
+            // value before this thread ever observes the main thread's load-start reset. A
+            // snapshot compare would then skip the whole buffering progression, and an app that
+            // requires bufferingStatus to reach 100% before state turns "playing" (a real-device
+            // guarantee) would never reveal its player.
+            if (Atomics.compareExchange(BrsDevice.sharedArray, DataType.VLP, progress, -1) === progress) {
+                // Emit the intermediate buffering steps between the last reported value and the
+                // current one, so a consumer that gates on a specific percentage never misses a
+                // threshold when the render loop is starved (e.g. during Task startup) and the
+                // load progress jumps. Apps commonly start playback at ~33% ("prebufferDone") and
+                // reveal UI at ~99%; delivering only a jump straight to 100% would skip the 33%
+                // callback and the video would never start. Mirrors a real device's gradual
+                // buffering progression. A regressed value means a new load began, so the
+                // progression restarts from zero.
+                let reported = progress < this.videoProgress ? 0 : Math.max(this.videoProgress, 0);
+                while (reported + 200 < progress) {
+                    reported += 200;
+                    this._video.setState(MediaEvent.Loading, Math.trunc(reported / 10));
+                }
+                this._video.setState(MediaEvent.Loading, Math.trunc(progress / 10));
+                this.videoProgress = progress;
+            }
         }
-        this.videoProgress = progress;
         const eventType = Atomics.load(BrsDevice.sharedArray, DataType.VDO);
-        const eventIndex = Atomics.load(BrsDevice.sharedArray, DataType.VDX);
-        if (eventType !== this.videoEvent) {
-            this.videoEvent = eventType;
-            if (eventType >= 0) {
+        if (eventType >= 0) {
+            const eventIndex = Atomics.load(BrsDevice.sharedArray, DataType.VDX);
+            // Consume the event exactly once: the CAS clears the slot so a same-type event
+            // published right after this one is still seen (a snapshot compare would drop it
+            // and leave the slot stuck). If the CAS fails, the main thread published a newer
+            // event between the load and the exchange; it is picked up next tick.
+            if (Atomics.compareExchange(BrsDevice.sharedArray, DataType.VDO, eventType, -1) === eventType) {
                 this._video.setState(eventType, eventIndex);
-                Atomics.store(BrsDevice.sharedArray, DataType.VDO, -1);
                 isDirty = true;
             }
         }

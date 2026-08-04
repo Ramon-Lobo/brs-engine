@@ -13,8 +13,10 @@ import {
     DeviceInfo,
     GraphicsData,
     MaxTextureMemory,
+    RendezvousEvent,
     getRokuOSVersion,
     isGraphicsData,
+    isRendezvousEvent,
 } from "../core/common";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { Server as SSDP } from "@lvcabral/node-ssdp";
@@ -28,8 +30,27 @@ import WebSocket, { WebSocketServer, RawData } from "ws";
 import packageInfo from "../../packages/node/package.json";
 
 const DEBUG = false;
-const ECPPORT = 8060;
+/** The port a Roku serves ECP on. Remote-control apps look for it here, so it stays the default. */
+const DEFAULT_ECPPORT = 8060;
+const ECPPORT = resolveEcpPort();
 const SSDPPORT = 1900;
+
+/**
+ * Resolves the ECP listen port, honoring `BRS_ECP_PORT`.
+ *
+ * The port is fixed on a real device, so it is fixed here too — but that makes the server
+ * unstartable whenever anything else already holds 8060 (another engine instance, a desktop build,
+ * a real remote-control tool). The override exists so those cases can bind elsewhere instead of
+ * failing; an unset or unusable value keeps the Roku default.
+ * @returns The port to listen on.
+ */
+function resolveEcpPort(): number {
+    const configured = Number(process.env.BRS_ECP_PORT);
+    if (Number.isInteger(configured) && configured > 0 && configured < 65536) {
+        return configured;
+    }
+    return DEFAULT_ECPPORT;
+}
 const MAC = getMacAddress();
 const UDN = "138aedd0-d6ad-11eb-b8bc-" + MAC.replaceAll(/:\s*/g, "");
 let ecp: restana.Service<restana.Protocol.HTTP>;
@@ -40,6 +61,11 @@ let isECPEnabled = false;
 let cliRegistry = new Map<string, string>();
 let lastGraphics: GraphicsData | undefined;
 const pendingGraphics: ((data: GraphicsData) => void)[] = [];
+/** Maximum rendezvous events queued between two `query/sgrendezvous` calls (matches Roku's spec). */
+const MAX_RENDEZVOUS_QUEUE = 1000;
+const rendezvousQueue: RendezvousEvent[] = [];
+let rendezvousDropCount = 0;
+let rendezvousTracking = false;
 
 if (!isMainThread && parentPort) {
     device = workerData.device;
@@ -57,6 +83,12 @@ if (!isMainThread && parentPort) {
             lastGraphics = data.graphics;
             while (pendingGraphics.length) {
                 pendingGraphics.shift()?.(data.graphics);
+            }
+        } else if (isRendezvousEvent(data)) {
+            if (rendezvousQueue.length < MAX_RENDEZVOUS_QUEUE) {
+                rendezvousQueue.push(data.rendezvous);
+            } else {
+                rendezvousDropCount++;
             }
         }
     });
@@ -88,6 +120,10 @@ function enableECP() {
     ecp.get("/query/icon/:appID", sendAppIcon);
     ecp.get("/query/registry/:appID", sendRegistry);
     ecp.get("/query/r2d2-bitmaps", sendR2D2Bitmaps);
+    ecp.get("/query/sgrendezvous", sendRendezvousQuery);
+    ecp.post("/sgrendezvous/track", sendRendezvousTrack);
+    ecp.post("/sgrendezvous/track/:channelId", sendRendezvousTrack);
+    ecp.post("/sgrendezvous/untrack", sendRendezvousUntrack);
     ecp.post("/input/:appID", sendInputQuery);
     ecp.post("/input", sendInputQuery);
     ecp.post("/launch/:appID", sendLaunchApp);
@@ -103,43 +139,52 @@ function enableECP() {
     }
     ecp.start(ECPPORT)
         .then((server) => {
-            // Create SSDP Server
-            ssdp = new SSDP({
-                location: {
-                    port: ECPPORT,
-                    path: "/",
-                },
-                adInterval: 120000,
-                ttl: 3600,
-                udn: `uuid:roku:ecp:${device.serialNumber}`,
-                ssdpSig: "Roku UPnP/1.0 Roku/9.1.0",
-                ssdpPort: SSDPPORT,
-                suppressRootDeviceAdvertisements: true,
-                headers: { "device-group.roku.com": "46F5CCE2472F2B14D77" },
-            });
-            ssdp.addUSN("roku:ecp");
-            ssdp._usns["roku:ecp"] = `uuid:roku:ecp:${device.serialNumber}`;
-            // Start server on all interfaces
-            ssdp.start()
-                .catch((e: Error) => {
-                    parentPort?.postMessage({
-                        ready: false,
-                        msg: `Failed to start SSDP server:${e.message}\n`,
-                    });
-                })
-                .then(() => {
-                    subscribeControl("ecp", (event: string) => {
-                        if (event === "home" || event === "poweroff") {
-                            Atomics.store(sharedArray, DataType.DBG, DebugCommand.EXIT);
-                        }
-                    });
-                    enableSendKeys(true);
-                    isECPEnabled = true;
-                    parentPort?.postMessage({
-                        ready: true,
-                        msg: "ECP and SSDP servers initialized!\n",
-                    });
+            /** Wires up control handling and reports the server as ready. */
+            const finishStartup = (msg: string) => {
+                subscribeControl("ecp", (event: string) => {
+                    if (event === "home" || event === "poweroff") {
+                        Atomics.store(sharedArray, DataType.DBG, DebugCommand.EXIT);
+                    }
                 });
+                enableSendKeys(true);
+                isECPEnabled = true;
+                parentPort?.postMessage({ ready: true, msg });
+            };
+            if (ECPPORT === DEFAULT_ECPPORT) {
+                // Create SSDP Server
+                ssdp = new SSDP({
+                    location: {
+                        port: ECPPORT,
+                        path: "/",
+                    },
+                    adInterval: 120000,
+                    ttl: 3600,
+                    udn: `uuid:roku:ecp:${device.serialNumber}`,
+                    ssdpSig: "Roku UPnP/1.0 Roku/9.1.0",
+                    ssdpPort: SSDPPORT,
+                    suppressRootDeviceAdvertisements: true,
+                    headers: { "device-group.roku.com": "46F5CCE2472F2B14D77" },
+                });
+                ssdp.addUSN("roku:ecp");
+                ssdp._usns["roku:ecp"] = `uuid:roku:ecp:${device.serialNumber}`;
+                // Start server on all interfaces
+                ssdp.start()
+                    .catch((e: Error) => {
+                        parentPort?.postMessage({
+                            ready: false,
+                            msg: `Failed to start SSDP server:${e.message}\n`,
+                        });
+                    })
+                    .then(() => {
+                        finishStartup("ECP and SSDP servers initialized!\n");
+                    });
+            } else {
+                // Discovery announces "a Roku serves ECP at this location", but a remote-control app
+                // only looks on the standard port, so advertising a relocated server publishes an
+                // endpoint nothing will use. SSDP also binds its own fixed port (1900), which is as
+                // likely to be held as the one we moved off — the reason for moving in the first place.
+                finishStartup(`ECP server initialized on port ${ECPPORT}, SSDP discovery disabled!\n`);
+            }
             // Create ECP-2 WebSocket Server
             const wss = new WebSocketServer({ noServer: true });
             wss.on("connection", function connection(ws) {
@@ -408,6 +453,53 @@ async function sendR2D2Bitmaps(req: any, res: any) {
     const data = await requestGraphics();
     res.setHeader("content-type", "application/xml");
     res.send(genR2D2BitmapsXml(data));
+}
+
+/**
+ * Starts ECP rendezvous tracking (`sgrendezvous/track`), like a real device requires developer mode
+ * (`--debug`) — in production mode this is a no-op and reports `tracking-enabled: false`, mirroring
+ * the empty `query/r2d2-bitmaps` response in production. Only one app can be tracked at a time, so
+ * starting tracking clears any previously queued events. The optional `channel_id` path parameter is
+ * accepted but ignored: the engine only ever runs one sideloaded app at a time.
+ * @param req - The HTTP request object
+ * @param res - The HTTP response object
+ */
+function sendRendezvousTrack(req: any, res: any) {
+    rendezvousTracking = device.debugOnCrash === true;
+    if (rendezvousTracking) {
+        rendezvousQueue.length = 0;
+        rendezvousDropCount = 0;
+    }
+    Atomics.store(sharedArray, DataType.RDT, rendezvousTracking ? 1 : 0);
+    res.setHeader("content-type", "application/xml");
+    res.send(genSgRendezvousStatusXml(rendezvousTracking));
+}
+
+/**
+ * Stops ECP rendezvous tracking (`sgrendezvous/untrack`). Any events already queued remain available
+ * for one final `query/sgrendezvous` call.
+ * @param req - The HTTP request object
+ * @param res - The HTTP response object
+ */
+function sendRendezvousUntrack(req: any, res: any) {
+    rendezvousTracking = false;
+    Atomics.store(sharedArray, DataType.RDT, 0);
+    res.setHeader("content-type", "application/xml");
+    res.send(genSgRendezvousStatusXml(false));
+}
+
+/**
+ * Returns the rendezvous events queued since tracking was enabled or the previous call
+ * (`query/sgrendezvous`), then drains the queue and drop count for the next window.
+ * @param req - The HTTP request object
+ * @param res - The HTTP response object
+ */
+function sendRendezvousQuery(req: any, res: any) {
+    const events = rendezvousQueue.splice(0);
+    const dropCount = rendezvousDropCount;
+    rendezvousDropCount = 0;
+    res.setHeader("content-type", "application/xml");
+    res.send(genSgRendezvousQueryXml(events, dropCount, rendezvousTracking));
 }
 
 /**
@@ -735,6 +827,46 @@ function genR2D2BitmapsXml(data?: GraphicsData) {
         bmp.ele("size", {}, bitmap.size);
         bmp.ele("name", {}, bitmap.name);
     }
+    xml.ele("status", {}, "OK");
+    return xml.end({ pretty: true });
+}
+
+/**
+ * Generates the `<sgrendezvous>` status response for `sgrendezvous/track` and `sgrendezvous/untrack`.
+ * @param enabled - Whether tracking is now enabled
+ * @returns The status XML string
+ */
+function genSgRendezvousStatusXml(enabled: boolean) {
+    const xml = xmlbuilder.create("sgrendezvous");
+    xml.ele("tracking-enabled", {}, enabled);
+    xml.ele("status", {}, "OK");
+    return xml.end({ pretty: true });
+}
+
+/**
+ * Generates the `<sgrendezvous>` events response for `query/sgrendezvous`.
+ * @param events - Rendezvous events queued since tracking started or the previous query
+ * @param dropCount - Number of events dropped because the queue exceeded its cap
+ * @param tracking - Whether tracking is currently enabled
+ * @returns The events XML string
+ */
+function genSgRendezvousQueryXml(events: RendezvousEvent[], dropCount: number, tracking: boolean) {
+    const xml = xmlbuilder.create("sgrendezvous");
+    const data = xml.ele("data");
+    data.ele("tracking-enabled", {}, tracking);
+    data.ele("plugin-id", {}, "dev");
+    data.ele("plugin-title", {}, device.appList?.find((app) => app.id === "dev")?.title ?? "dev");
+    data.ele("drop-count", {}, dropCount);
+    data.ele("count", {}, events.length);
+    for (const event of events) {
+        const item = data.ele("item");
+        item.ele("id", {}, event.id);
+        item.ele("start-tm", {}, event.startTm);
+        item.ele("end-tm", {}, event.endTm);
+        item.ele("line-number", {}, event.line);
+        item.ele("file", {}, event.file);
+    }
+    xml.ele("timestamp", {}, Date.now());
     xml.ele("status", {}, "OK");
     return xml.end({ pretty: true });
 }

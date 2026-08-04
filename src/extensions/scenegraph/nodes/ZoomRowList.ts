@@ -12,6 +12,7 @@ import {
     IfDraw2D,
     Rect,
     RoFont,
+    isBrsString,
 } from "brs-engine";
 import { sgRoot } from "../SGRoot";
 import { ContentNode } from "./ContentNode";
@@ -19,8 +20,10 @@ import { customNodeExists } from "../factory/NodeFactory";
 import { brsValueOf, jsValueOf } from "../factory/Serializer";
 import { Font } from "./Font";
 import { Group } from "./Group";
+import { Node } from "./Node";
 import { ArrayGrid, FocusStyle } from "./ArrayGrid";
 import { FieldKind, FieldModel } from "../SGTypes";
+import { resolveRowItemSubpart } from "../SGUtil";
 import { SGNodeType } from ".";
 
 interface RowMetrics {
@@ -34,8 +37,6 @@ interface RowMetrics {
 }
 
 const ValidFocusStyles = new Set(Object.values(FocusStyle).map((style) => style.toLowerCase()));
-
-const RowFocusStyleWrap = FocusStyle.FixedFocusWrap.toLowerCase();
 
 export class ZoomRowList extends ArrayGrid {
     readonly defaultFields: FieldModel[] = [
@@ -71,7 +72,6 @@ export class ZoomRowList extends ArrayGrid {
         { name: "rowUnfocused", type: "integer", value: "-1", alwaysNotify: true },
         { name: "rowItemSelected", type: "intarray", value: "[]", alwaysNotify: true },
         { name: "rowItemFocused", type: "intarray", value: "[]", alwaysNotify: true },
-        { name: "scrollingStatus", type: "boolean", value: "false", alwaysNotify: true },
         { name: "rowsRendered", type: "intarray", value: "[]", alwaysNotify: true },
         { name: "rowItemsRendered", type: "intarray", value: "[]", alwaysNotify: true },
         { name: "currFocusRow", type: "float", value: "-1.0", alwaysNotify: true },
@@ -131,8 +131,9 @@ export class ZoomRowList extends ArrayGrid {
         this.defaultItemZoomYOffset = 0;
         this.hasNinePatch = true;
         this.focusField = "zoomRowListHasFocus";
-        const rowFocusStyle = (this.getValueJS("rowFocusAnimationStyle") as string) ?? FocusStyle.FixedFocusWrap;
-        this.wrap = rowFocusStyle.toLowerCase() === RowFocusStyleWrap;
+        // Vertical (row-to-row) wrapping is controlled by the boolean `wrap` field, NOT by
+        // `rowFocusAnimationStyle` (which governs horizontal item focus within a row).
+        this.wrap = this.isWrapEnabled();
         this.focusIndex = 0;
         this.rowFocus[0] = 0;
         this.nodeWidth = this.sceneRect.width;
@@ -160,12 +161,12 @@ export class ZoomRowList extends ArrayGrid {
             if (typeof coords[0] === "number" && typeof coords[1] === "number") {
                 this.setFocusedItem(coords[0], coords[1]);
             }
-        } else if (fieldName === "rowfocusanimationstyle" && value instanceof BrsString) {
+        } else if (fieldName === "rowfocusanimationstyle" && isBrsString(value)) {
+            // Horizontal item focus style; validate but do NOT let it drive vertical wrap.
             const style = value.toString().toLowerCase();
             if (!ValidFocusStyles.has(style)) {
                 return;
             }
-            this.wrap = style === RowFocusStyleWrap;
         } else if (fieldName === "wrap" && value instanceof BrsBoolean) {
             this.wrap = value.toBoolean();
         } else if (fieldName === "rowwidth" && isNumberComp(value)) {
@@ -198,6 +199,9 @@ export class ZoomRowList extends ArrayGrid {
         } else {
             colIndex = 0;
         }
+        // Emit the scroll pulse BEFORE the settled focus fields go out — the falling edge precedes
+        // the settle on a device, and apps rely on that order (see ArrayGrid.armScrollPulse).
+        this.emitScrollPulse();
         const previousRow = this.focusIndex;
         if (previousRow !== rowIndex) {
             super.setValue("rowUnfocused", new Int32(previousRow));
@@ -208,6 +212,15 @@ export class ZoomRowList extends ArrayGrid {
         super.setValue("rowFocused", new Int32(rowIndex));
         super.setValue("rowItemFocused", new RoArray([new Int32(rowIndex), new Int32(colIndex)]));
         super.setValue("currFocusRow", new Float(rowIndex));
+    }
+
+    /**
+     * Vertical (row-to-row) wrap state. Read live from the `wrap` field so it always reflects the
+     * current value regardless of how the field was populated (setValue, config append, or a silent
+     * factory path that bypasses the overridden setValue). See the Roku ZoomRowList `wrap` field.
+     */
+    private isWrapEnabled(): boolean {
+        return jsValueOf(this.getValue("wrap")) === true;
     }
 
     protected handleUpDown(key: string) {
@@ -225,21 +238,25 @@ export class ZoomRowList extends ArrayGrid {
             return false;
         }
         let next = this.focusIndex + offset;
-        if (this.wrap) {
+        if (this.isWrapEnabled()) {
             if (this.content.length === 0) {
                 return false;
             }
             next = (next + this.content.length) % this.content.length;
         }
-        if (next >= 0 && next < this.content.length) {
-            super.setValue("scrollingStatus", BrsBoolean.True);
-            this.focusIndex = next;
+        // Only consume the key when the focus actually moves to a different row. With a single row
+        // (or any wrap that lands back on the current row) the focus does not change, so the key must
+        // stay unhandled and propagate up the node tree — matching a real device, where up/down on a
+        // single-row grid moves focus to a sibling above/below (e.g. a ButtonBar). RowList guards the
+        // same way.
+        if (next >= 0 && next < this.content.length && next !== this.focusIndex) {
             this.rowFocus[next] ??= 0;
+            // Do NOT assign this.focusIndex here: setFocusedItem reads it as the OUTGOING row to emit
+            // rowUnfocused (and assigns it itself). Setting it first made that emission dead, so an
+            // app collapsing the outgoing row off rowUnfocused never got the callback.
             this.setFocusedItem(next, this.rowFocus[next]);
-            super.setValue("currFocusRow", new Float(next));
             handled = true;
         }
-        super.setValue("scrollingStatus", BrsBoolean.False);
         return handled;
     }
 
@@ -265,9 +282,10 @@ export class ZoomRowList extends ArrayGrid {
         }
         if (nextCol !== this.rowFocus[currentRow]) {
             this.rowFocus[currentRow] = nextCol;
+            // This path emits the settle directly (it does not go through setFocusedItem), so the
+            // pulse is emitted here — see ArrayGrid.armScrollPulse for why the order matters.
+            this.emitScrollPulse();
             super.setValue("rowItemFocused", new RoArray([new Int32(currentRow), new Int32(nextCol)]));
-            super.setValue("scrollingStatus", BrsBoolean.True);
-            super.setValue("scrollingStatus", BrsBoolean.False);
             return true;
         }
         return false;
@@ -282,6 +300,16 @@ export class ZoomRowList extends ArrayGrid {
             return true;
         }
         return false;
+    }
+
+    /**
+     * Resolves an ifSGNodeBoundingRect sub part to the matching rendered item component. Like RowList,
+     * a ZoomRowList holds a 2-D grid of components in `rowItemComps[row][col]` (not the flat ArrayGrid
+     * `itemComps[]`), so the base resolver never matches and every query falls back to the whole-list
+     * rect. See `resolveRowItemSubpart` for the id mapping.
+     */
+    protected resolveSubpart(itemNumber: string): Node | undefined {
+        return resolveRowItemSubpart(itemNumber, this.rowItemComps, this.focusIndex, this.rowFocus);
     }
 
     protected renderContent(
@@ -424,7 +452,12 @@ export class ZoomRowList extends ArrayGrid {
 
         const titleHeight = this.renderRowTitle(rowIndex, rect, this.nodeWidth, opacity, draw2D);
         const counterHeight = this.renderRowCounter(rowIndex, rect, metrics, this.nodeWidth, opacity, draw2D);
-        const rowY = rect.y + Math.max(titleHeight, counterHeight) + metrics.itemYOffset;
+        // `rowItemYOffset` positions the item row relative to the row top, independently of the
+        // title/counter (which draw at their own rowTitleOffset/rowCounterOffset). They are NOT
+        // stacked (Roku spec) — the title occupies the reserved offset band. Only when no offset is
+        // configured do we reserve the measured band so the title and posters do not overlap.
+        const reservedBand = metrics.itemYOffset > 0 ? 0 : Math.max(titleHeight, counterHeight);
+        const rowY = rect.y + metrics.itemYOffset + reservedBand;
 
         const itemRect: Rect = {
             x: rect.x,
@@ -498,7 +531,7 @@ export class ZoomRowList extends ArrayGrid {
     }
 
     private canWrapRows(displayRows: number): boolean {
-        return this.wrap && displayRows > 0 && this.content.length >= displayRows;
+        return this.isWrapEnabled() && displayRows > 0 && this.content.length >= displayRows;
     }
 
     private canWrapItems(numCols: number, metrics: RowMetrics, availableWidth: number) {
@@ -643,7 +676,8 @@ export class ZoomRowList extends ArrayGrid {
             itemComp.setValue("height", brsValueOf(itemRect.height), false);
             itemComp.setValue("rowHasFocus", BrsBoolean.from(this.focusIndex === rowIndex), false);
             itemComp.setValue(this.focusField, BrsBoolean.from(nodeFocus), false);
-            itemComp.setValue("itemHasFocus", BrsBoolean.from(focused), false);
+            // Only the focused item of a focused list reports itemHasFocus=true (see RowList).
+            itemComp.setValue("itemHasFocus", BrsBoolean.from(focused && nodeFocus), false);
             itemComp.setValue("focusPercent", new Float(focused ? 1 : 0), false);
             itemComp.setValue("rowFocusPercent", new Float(this.focusIndex === rowIndex ? 1 : 0), false);
         }

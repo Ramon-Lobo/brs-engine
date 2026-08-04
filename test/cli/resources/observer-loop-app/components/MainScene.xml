@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<!--
+    Models the "manual field alias" pattern: an alwaysNotify field (aliasField) whose onChange
+    handler (onAlias) writes the SAME field back to itself. A direct BrightScript assignment
+    dispatches its observers synchronously even when reentrant (Roku's set-then-read-back
+    semantics; only engine-initiated emissions such as itemFocused defer), so onAlias runs nested
+    inside onSelected and the per-field `notifying` guard must suppress the re-entrant self-write,
+    otherwise it recurses/floods forever.
+-->
+<component name="MainScene" extends="Scene">
+    <interface>
+        <field id="runTrigger" type="integer" onChange="onSelected" />
+        <field id="aliasField" type="vector2d" alwaysNotify="true" onChange="onAlias" />
+    </interface>
+    <script type="text/brightscript"><![CDATA[
+    sub init()
+        m.aliasCount = 0
+    end sub
+
+    sub onSelected()
+        print "onSelected"
+        ' Direct reentrant assignment: aliasField's onChange runs synchronously (nested).
+        m.top.aliasField = [1, 2]
+        print "onSelected done"
+    end sub
+
+    sub onAlias()
+        m.aliasCount = m.aliasCount + 1
+        print "onAlias count="; m.aliasCount
+        ' Self-write back to the same alwaysNotify field must NOT re-trigger onAlias.
+        m.top.aliasField = m.top.aliasField
+    end sub
+    ]]></script>
+</component>

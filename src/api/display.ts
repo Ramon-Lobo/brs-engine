@@ -43,12 +43,41 @@ let videoState = "stop";
 let videoRect = { x: 0, y: 0, w: 0, h: 0 };
 let videoLoop = false;
 
+// Frame Notification (opt-in, for embedders mirroring the display elsewhere)
+let frameNotify = false;
+let frameCount = 0;
+let displayBlanked = false;
+
 // Initialize Display Module
 let displayState = true;
 let overscanMode = "disabled";
 let aspectRatio = 16 / 9;
 let trickPlayBar = false;
 let supportCaptions = false;
+
+/** OS 15.3 `Video.captionRenderArea` — where/how captions are rendered on screen. */
+interface CaptionRenderArea {
+    mode: "fullscreen" | "auto" | "override";
+    overridePlacement: boolean;
+    scaleFonts: "off" | "by-width" | "by-height";
+    keepSafeMargins: boolean;
+    x: number;
+    y: number;
+    width: number;
+    height: number;
+}
+// Default keeps the pre-15.3 behavior: captions only in full-screen playback.
+let captionRenderArea: CaptionRenderArea = {
+    mode: "fullscreen",
+    overridePlacement: false,
+    scaleFonts: "by-width",
+    keepSafeMargins: true,
+    x: 0,
+    y: 0,
+    width: 0,
+    height: 0,
+};
+
 interface CachedSubtitleMeasurement {
     metricsWidth: number;
     calculatedBoxWidth: number; // Stores (metrics.width + padding * 2)
@@ -129,8 +158,17 @@ export function unsubscribeDisplay(observerId: string) {
  * @param eventData Optional data associated with the event
  */
 function notifyAll(eventName: string, eventData?: any) {
-    for (const [_id, callback] of observers) {
-        callback(eventName, eventData);
+    for (const [id, callback] of observers) {
+        try {
+            callback(eventName, eventData);
+        } catch (err: any) {
+            // Display events are raised from inside the requestAnimationFrame loop (see
+            // drawVideoFrame), and the loop reschedules itself *after* the notification. An observer
+            // that throws would unwind past that and permanently stop rendering, so host code never
+            // gets to break the loop. Reported to the console because routing it through notifyAll
+            // would recurse into the same faulty observer.
+            console.error(`[display] observer "${id}" failed on "${eventName}" event:`, err);
+        }
     }
 }
 
@@ -195,8 +233,7 @@ export function drawSplashScreen(imgBmp: ImageBitmap, icon = false) {
         const dims = getDisplayModeDims();
         let w = dims.width;
         let h = dims.height;
-        bufferCanvas.width = w;
-        bufferCanvas.height = h;
+        resizeBuffer(w, h);
         if (icon) {
             const x = Math.trunc((w - imgBmp.width) / 2);
             const y = Math.trunc((h - imgBmp.height) / 2);
@@ -204,6 +241,9 @@ export function drawSplashScreen(imgBmp: ImageBitmap, icon = false) {
             bufferCtx.fillRect(0, 0, w, h);
             bufferCtx.drawImage(imgBmp, x, y);
         } else {
+            // Explicit, because resizeBuffer() only resets the canvas when the size actually changes:
+            // a splash with alpha would otherwise show the previous app's pixels through it.
+            bufferCtx.clearRect(0, 0, w, h);
             bufferCtx.drawImage(imgBmp, 0, 0, w, h);
         }
         drawBufferImage();
@@ -228,22 +268,73 @@ export function getScreenshot(): ImageData | null {
 }
 
 /**
+ * Enables or disables the `framePainted` and `frameCleared` events.
+ *
+ * The engine only repaints when the application actually draws something, so a settled app can go a
+ * long time without producing a frame. An embedder that mirrors the display elsewhere (for example to
+ * a video stream) cannot poll for that efficiently, so these events tell it exactly when the display
+ * changed. Disabled by default: when no one is listening the notification costs nothing.
+ * @param enabled True to report every display repaint, false to stop
+ */
+export function setFrameNotify(enabled: boolean) {
+    if (enabled) {
+        // Restarted on every enable, not only on the false -> true edge, so an embedder that re-arms
+        // notification (a stream restart, for example) can always key on frame 1 being the first one.
+        // The blank is forgotten for the same reason: a freshly armed observer knows nothing about the
+        // current state, so the next blank has to be reported to it even if it repeats an earlier one.
+        frameCount = 0;
+        displayBlanked = false;
+    }
+    frameNotify = enabled;
+}
+
+/**
+ * Gets the display buffer canvas, the source the visible display is drawn from.
+ *
+ * Unlike the visible `#display` canvas, this carries no overscan guidelines and is at the resolution
+ * the app actually renders at, so it is the canvas to copy when mirroring the screen. That resolution
+ * is the app's screen size (`roScreen`/`roSGScreen`), which is not necessarily the display mode's:
+ * `CreateObject("roScreen", true, 640, 480)` renders 640x480 in any mode. It is the live buffer and
+ * must be treated as read-only; the returned object stays valid for the session, but its dimensions
+ * change whenever the app's screen does, so re-read them on each frame (a `resolution` event is
+ * raised before every change).
+ * @returns The display buffer, or null if the display module is not initialized
+ */
+export function getDisplayBuffer(): OffscreenCanvas | null {
+    return bufferCtx ? bufferCanvas : null;
+}
+
+/**
+ * Resizes the display buffer, reporting the new dimensions first.
+ *
+ * The `resolution` event has to precede the resize so that an embedder mirroring the buffer never sees
+ * a frame at dimensions it was not told about.
+ * @param width New buffer width
+ * @param height New buffer height
+ */
+function resizeBuffer(width: number, height: number) {
+    if (bufferCanvas.width !== width || bufferCanvas.height !== height) {
+        notifyAll("resolution", { width: width, height: height });
+        bufferCanvas.width = width;
+        bufferCanvas.height = height;
+    }
+}
+
+/**
  * Updates the display buffer with new image data.
  * @param buffer ImageData to render on the display
  */
 export function updateBuffer(buffer: ImageData) {
     if (bufferCtx) {
-        if (bufferCanvas.width !== buffer.width || bufferCanvas.height !== buffer.height) {
-            notifyAll("resolution", { width: buffer.width, height: buffer.height });
-            bufferCanvas.width = buffer.width;
-            bufferCanvas.height = buffer.height;
-        }
+        resizeBuffer(buffer.width, buffer.height);
         bufferCtx.putImageData(buffer, 0, 0);
         createImageBitmap(buffer).then((bitmap) => {
             lastImage = bitmap;
         });
         if (!videoLoop) {
-            clearDisplay();
+            // Deliberately clearCanvas() and not clearDisplay(): this blank is transient, the repaint
+            // is queued right below, so it must not be reported as a frame.
+            clearCanvas();
             lastFrameReq = globalThis.requestAnimationFrame(drawBufferImage);
         }
         firstFrame = false;
@@ -279,9 +370,44 @@ function drawBufferImage() {
                 }
             }
         } else {
-            clearDisplay();
+            clearCanvas();
         }
         statsUpdate(true);
+        if (displayState) {
+            notifyFrame();
+        } else {
+            // The app kept drawing, so bufferCanvas holds fresh content, but the display is disabled
+            // and showing black. Reporting a frame here would make a mirroring embedder copy the
+            // buffer and show content the screen is not: this is a blank, same as clearDisplay().
+            notifyCleared();
+        }
+    }
+}
+
+/**
+ * Notifies observers that the visible display changed, if frame notification is enabled.
+ * The counter is a plain number so that emitting on a 60fps path allocates nothing.
+ */
+function notifyFrame() {
+    displayBlanked = false;
+    if (frameNotify) {
+        notifyAll("framePainted", ++frameCount);
+    }
+}
+
+/**
+ * Notifies observers that the visible display was blanked, if frame notification is enabled.
+ *
+ * Reported as its own event rather than as a frame, because it cannot be served from the buffer:
+ * blanking never touches bufferCanvas, so an embedder told "new frame" here would copy the last drawn
+ * image and show that instead of the black the display is actually showing. Repeats are collapsed: a
+ * disabled display keeps blanking on every animation frame, and the mirror only needs to be told once.
+ */
+function notifyCleared() {
+    const wasBlanked = displayBlanked;
+    displayBlanked = true;
+    if (frameNotify && !wasBlanked) {
+        notifyAll("frameCleared");
     }
 }
 
@@ -324,7 +450,7 @@ function drawVideoFrame() {
         if (lastImage) {
             bufferCtx.drawImage(lastImage, 0, 0);
         }
-        if (getCaptionState() && !trickPlayBar) {
+        if (getCaptionState() && !trickPlayBar && shouldDrawCaptions()) {
             drawSubtitles(bufferCtx);
         }
     }
@@ -351,7 +477,20 @@ function drawSubtitles(ctx: CanvasRenderingContext2D) {
     const textOpacity = CaptionOpacities.get(getCaptionStyleOption("text/opacity")) ?? 1;
     const textSize = getCaptionStyleOption("text/size");
     const textEffect = getCaptionStyleOption("text/effect");
-    const fontSize = CaptionSizes.get(textSize)![fhd];
+
+    // Resolve the render area (canvas coords) from captionRenderArea.mode; `raw` is the
+    // area before safe-margin insets (used for font scaling), `area` after insets (placement).
+    const { raw, area } = getCaptionArea(ctx.canvas.width, ctx.canvas.height);
+
+    // Scale the caption font relative to the render area vs. full screen (non-fullscreen modes only).
+    let fontSize = CaptionSizes.get(textSize)![fhd];
+    if (captionRenderArea.mode !== "fullscreen") {
+        if (captionRenderArea.scaleFonts === "by-width") {
+            fontSize = Math.max(1, Math.round(fontSize * (raw.width / ctx.canvas.width)));
+        } else if (captionRenderArea.scaleFonts === "by-height") {
+            fontSize = Math.max(1, Math.round(fontSize * (raw.height / ctx.canvas.height)));
+        }
+    }
     ctx.font = `${fontSize}px ${fontFamily}, sans-serif`;
 
     if (lastCachedFontSize !== fontSize || lastCachedFontFamily !== fontFamily) {
@@ -361,9 +500,13 @@ function drawSubtitles(ctx: CanvasRenderingContext2D) {
     ctx.fillStyle = textColor!;
     ctx.textAlign = "center";
     ctx.textBaseline = "middle";
-    const baseX = ctx.canvas.width / 2;
+    const baseX = area.x + area.width / 2;
     const lineHeight = fontSize * 1.2;
-    let y = ctx.canvas.height * 0.9 - lineHeight / 2;
+    // Captions sit at the center-bottom of the render area. In `override` mode with
+    // overridePlacement disabled the app opts out of forced placement, so anchor to the
+    // area's vertical center instead (content-driven cue positions are not rendered).
+    const anchorBottom = captionRenderArea.overridePlacement || captionRenderArea.mode !== "override";
+    let y = anchorBottom ? area.y + area.height - lineHeight / 2 : area.y + area.height / 2 - lineHeight / 2;
 
     for (const track of player.textTracks) {
         if (track.mode !== "showing" || !track.activeCues?.length) {
@@ -555,6 +698,15 @@ export function clearDisplay(cancelFrame?: boolean) {
         globalThis.cancelAnimationFrame(lastFrameReq);
         videoLoop = false;
     }
+    clearCanvas();
+    notifyCleared();
+}
+
+/**
+ * Blanks the display canvas without reporting a frame.
+ * Used where the blank is transient and a repaint is already queued.
+ */
+function clearCanvas() {
     if (ctx && Platform.inSafari) {
         ctx.fillStyle = "black";
         ctx.fillRect(0, 0, ctx.canvas.width, ctx.canvas.height);
@@ -591,7 +743,21 @@ export function getDisplayMode() {
  * @param enabled True to enable display, false to disable
  */
 export function setDisplayState(enabled: boolean) {
+    const wasEnabled = displayState;
     displayState = enabled;
+    if (wasEnabled === enabled || videoLoop) {
+        // The video loop repaints on its own, so it handles both directions without help here.
+        return;
+    }
+    if (enabled) {
+        // Restore what the buffer holds: a settled app would not repaint on its own, leaving the
+        // display black after being re-enabled.
+        lastFrameReq = globalThis.requestAnimationFrame(drawBufferImage);
+    } else {
+        // Conversely, nothing else would blank the canvas or tell a mirroring embedder to blank its
+        // own copy, so do it here, when the display is turned off.
+        clearDisplay();
+    }
 }
 
 /**
@@ -643,6 +809,90 @@ export function getCaptionMode() {
 function getCaptionState(): boolean {
     const mode = deviceData.captionMode;
     return supportCaptions && (mode === "On" || (mode === "When mute" && isVideoMuted()));
+}
+
+/**
+ * Determines whether the video plane currently covers the whole display.
+ * Mirrors the fallback used by `drawVideoFrame` (a zero width/height rect means full-screen).
+ * @returns True if the video is rendered full-screen
+ */
+function isVideoFullscreen(): boolean {
+    if (!bufferCanvas) {
+        return true;
+    }
+    const width = videoRect.w || bufferCanvas.width;
+    const height = videoRect.h || bufferCanvas.height;
+    return videoRect.x <= 0 && videoRect.y <= 0 && width >= bufferCanvas.width && height >= bufferCanvas.height;
+}
+
+/**
+ * Applies the captionRenderArea `mode` gate. On a real Roku captions only appear during
+ * full-screen playback (the default `fullscreen` mode); `auto`/`override` opt into rendering
+ * captions for windowed/preview video as well.
+ * @returns True if captions may be drawn for the current video geometry
+ */
+function shouldDrawCaptions(): boolean {
+    return captionRenderArea.mode === "fullscreen" ? isVideoFullscreen() : true;
+}
+
+/**
+ * Resolves the caption render rectangle (in canvas coordinates) from the current
+ * captionRenderArea mode. Returns both the `raw` area (before safe-margin insets, used for
+ * font scaling) and the placement `area` (after insets).
+ * @param canvasW Canvas width in pixels
+ * @param canvasH Canvas height in pixels
+ */
+function getCaptionArea(canvasW: number, canvasH: number) {
+    let x = 0;
+    let y = 0;
+    let width = canvasW;
+    let height = canvasH;
+    if (captionRenderArea.mode === "auto") {
+        x = videoRect.x || 0;
+        y = videoRect.y || 0;
+        width = videoRect.w || canvasW;
+        height = videoRect.h || canvasH;
+    } else if (captionRenderArea.mode === "override") {
+        // Per the spec, override x/y are offsets relative to the video's on-screen position.
+        x = (videoRect.x || 0) + captionRenderArea.x;
+        y = (videoRect.y || 0) + captionRenderArea.y;
+        width = captionRenderArea.width || canvasW;
+        height = captionRenderArea.height || canvasH;
+    }
+    const raw = { x, y, width, height };
+    const area = { ...raw };
+    if (captionRenderArea.keepSafeMargins) {
+        const insetX = width * 0.1;
+        const insetY = height * 0.1;
+        area.x += insetX;
+        area.y += insetY;
+        area.width -= insetX * 2;
+        area.height -= insetY * 2;
+    }
+    return { raw, area };
+}
+
+/**
+ * Sets the OS 15.3 `Video.captionRenderArea`, normalizing its attributes with the documented
+ * per-mode defaults. Keys arrive lowercased from the SceneGraph associative-array serializer.
+ * @param area Render-area object posted from the worker (or a bare `{ mode }` reset)
+ */
+export function setCaptionRenderArea(area: { [key: string]: any }) {
+    const rawMode = typeof area?.mode === "string" ? area.mode.toLowerCase() : "fullscreen";
+    const mode = rawMode === "auto" || rawMode === "override" ? rawMode : "fullscreen";
+    const isOverride = mode === "override";
+    const rawScale = typeof area?.scalefonts === "string" ? area.scalefonts.toLowerCase() : "by-width";
+    const scaleFonts = rawScale === "off" || rawScale === "by-height" ? rawScale : "by-width";
+    captionRenderArea = {
+        mode,
+        overridePlacement: typeof area?.overrideplacement === "boolean" ? area.overrideplacement : isOverride,
+        scaleFonts,
+        keepSafeMargins: typeof area?.keepsafemargins === "boolean" ? area.keepsafemargins : !isOverride,
+        x: Math.trunc(area?.x ?? 0),
+        y: Math.trunc(area?.y ?? 0),
+        width: Math.trunc(area?.width ?? 0),
+        height: Math.trunc(area?.height ?? 0),
+    };
 }
 
 /**

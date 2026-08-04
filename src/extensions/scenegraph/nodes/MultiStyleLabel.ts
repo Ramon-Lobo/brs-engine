@@ -14,7 +14,7 @@ import type { Font } from "./Font";
 import { FieldKind, FieldModel } from "../SGTypes";
 import { SGNodeType } from ".";
 import { SGNodeFactory } from "../factory/NodeFactory";
-import { convertHexColor, rotateTranslation } from "../SGUtil";
+import { convertHexColor } from "../SGUtil";
 
 /** A resolved drawing style: a configured Font node plus its text color. */
 interface DrawStyle {
@@ -138,22 +138,26 @@ export class MultiStyleLabel extends Group {
             const size = this.getDimensions();
             const rect: Rect = { x: 0, y: 0, ...size };
             this.measured = this.renderLabel(rect, 0, 1);
-            rect.width = Math.max(this.measured.width, size.width);
-            rect.height = Math.max(this.measured.height, size.height);
-            this.rectLocal = { x: 0, y: 0, width: rect.width, height: rect.height };
+            this.setMeasuredBoundingRects(
+                Math.max(this.measured.width, size.width),
+                Math.max(this.measured.height, size.height)
+            );
         }
         return this.measured;
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible()) {
             this.updateRenderTracking(true);
             return;
         }
-        const nodeTrans = this.getTranslation();
-        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const size = this.getDimensions();
         const rect = { x: drawTrans[0], y: drawTrans[1], width: size.width, height: size.height };
         const rotation = angle + this.getRotation();

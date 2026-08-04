@@ -36,6 +36,7 @@ import {
     BrsInterface,
     toAssociativeArray,
     isCollection,
+    resolveAnonymousCallable,
 } from "../brsTypes";
 import { BrsExtension, ISGNode, isSceneGraphNode } from "../extensions";
 import { tryCoerce } from "../brsTypes/Coercion";
@@ -115,6 +116,8 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
     private _tryMode = false;
     private _debugMode: DebugMode = DebugMode.NONE;
     private _dotLevel = 0;
+    /** The callee expression of the `Expr.Call` currently being evaluated (call position). */
+    private _activeCallee?: Expr.Expression;
     private _printed = false; // Prevent the warning when no entry point exists
     private _lastStmt: Stmt.Statement | null = null;
 
@@ -266,8 +269,8 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
     constructor(options?: Partial<ExecutionOptions>, useMainEnv: boolean = false) {
         this._environment = useMainEnv ? MainEnvironment : new Environment(new RoAssociativeArray([]));
         Object.assign(this.options, options);
-        BrsDevice.stdout = new OutputProxy(this.options.stdout, this.options.post);
-        BrsDevice.stderr = new OutputProxy(this.options.stderr, this.options.post);
+        BrsDevice.stdout = new OutputProxy(this.options.stdout, this.options.post, BrsDevice.deviceInfo.logLevel);
+        BrsDevice.stderr = new OutputProxy(this.options.stderr, this.options.post, BrsDevice.deviceInfo.logLevel);
         if (this.options.root) {
             BrsDevice.fileSystem.setRoot(this.options.root);
         }
@@ -442,6 +445,15 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
         let maybeCallback = this.evaluate(callbackVariable);
         if (maybeCallback.kind === ValueKind.Callable) {
             return maybeCallback;
+        }
+        // Anonymous functions aren't bound to any variable, but they carry a generated name
+        // (see Callable) that some libraries round-trip through `toStr()` and hand to
+        // `observeField`. Resolve those by name from the anonymous-callable registry.
+        if (functionName.toLowerCase().startsWith("$anon_")) {
+            const anon = resolveAnonymousCallable(functionName);
+            if (anon) {
+                return anon;
+            }
         }
 
         return BrsInvalid.Instance;
@@ -1138,6 +1150,12 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
             this._tryMode = tryMode;
         } catch (err: any) {
             this._tryMode = tryMode;
+            if (this.inExitMode()) {
+                // The debugger's `quit`/EXIT unwinds by re-throwing the original RuntimeError. Let it
+                // propagate past user try/catch so the app terminates instead of the catch block
+                // swallowing the exit and looping forever.
+                throw err;
+            }
             if (!(err instanceof BrsError) || err instanceof Stmt.GotoLabel || err instanceof Stmt.ReturnValue) {
                 throw err;
             }
@@ -1241,7 +1259,14 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
 
     visitCall(expression: Expr.Call) {
         // evaluate the function to call (it could be the result of another function call)
-        const evaluated = this.evaluate(expression.callee);
+        const prevCallee = this._activeCallee;
+        this._activeCallee = expression.callee;
+        let evaluated: BrsType;
+        try {
+            evaluated = this.evaluate(expression.callee);
+        } finally {
+            this._activeCallee = prevCallee;
+        }
         const callee = evaluated instanceof RoFunction ? evaluated.unbox() : evaluated;
         // evaluate all of the arguments as well (they could also be function calls)
         let args = expression.args.map(this.evaluate, this);
@@ -1327,6 +1352,28 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
                 const target = source.get(new BrsString(expression.name.text));
                 if (isBrsCallable(target) && source instanceof RoAssociativeArray) {
                     target.setContext(source);
+                }
+                // A SceneGraph node may declare an XML <interface> field named after one of its
+                // component methods (e.g. a boolean field `isInFocusChain`). On Roku the field only
+                // shadows the method for reads — call syntax still resolves the interface method.
+                if (!isBrsCallable(target) && this._activeCallee === expression && isSceneGraphNode(source)) {
+                    const method = source.getMethod(expression.name.text);
+                    if (method) {
+                        return method;
+                    }
+                }
+                // An AA member read never yields an interface method on Roku (`aa.items` with no
+                // such key is invalid); the method resolves only at a call site (`aa.items()`),
+                // where a stored element still shadows it (the classic `aa.count` gotcha).
+                if (
+                    target instanceof BrsInvalid &&
+                    this._activeCallee === expression &&
+                    source instanceof RoAssociativeArray
+                ) {
+                    const method = source.getMethod(expression.name.text);
+                    if (method) {
+                        return method;
+                    }
                 }
                 return target;
             } catch (err: any) {
@@ -1430,7 +1477,10 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
     visitFor(statement: Stmt.For): BrsType {
         // BrightScript for/to loops evaluate the counter initial value, final value, and increment
         // values *only once*, at the top of the for/to loop.
-        let increment = this.evaluate(statement.increment) as Int32 | Float;
+        // Boxed numbers (roInt/roFloat/…) are valid in every numeric slot, matching Roku — e.g. a
+        // SceneGraph field read returns a boxed value, and `for i = node.maxLines to 0 step -1`
+        // must not crash. Unbox them up front so the comparisons below see intrinsic types.
+        let increment = this.unboxIfNumber(this.evaluate(statement.increment)) as Int32 | Float;
         if (increment instanceof Float) {
             increment = new Int32(Math.trunc(increment.getValue()));
         }
@@ -1449,16 +1499,19 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
                 new Expr.Literal(increment, statement.increment.location)
             )
         );
-        let startValue: BrsType;
+        let startValue: Int32 | Float;
         if (this.environment.continueFor) {
             this.execute(step);
-            startValue = this.evaluate(new Expr.Variable(counterName)) as Int32 | Float;
+            startValue = this.unboxIfNumber(this.evaluate(new Expr.Variable(counterName))) as Int32 | Float;
             this.environment.continueFor = false;
         } else {
             this.execute(statement.counterDeclaration);
-            startValue = this.evaluate(statement.counterDeclaration.value) as Int32 | Float;
+            startValue = this.unboxIfNumber(this.evaluate(statement.counterDeclaration.value)) as Int32 | Float;
+            // Keep the loop variable intrinsic even when the initial value was boxed, so the body
+            // and the comparisons below always see the same numeric type.
+            this.environment.define(Scope.Function, counterName.text, startValue, counterName.location);
         }
-        const finalValue = this.evaluate(statement.finalValue) as Int32 | Float;
+        const finalValue = this.unboxIfNumber(this.evaluate(statement.finalValue)) as Int32 | Float;
         if (
             (startValue.getValue() > finalValue.getValue() && increment.getValue() > 0) ||
             (startValue.getValue() < finalValue.getValue() && increment.getValue() < 0)
@@ -1469,7 +1522,7 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
 
         if (increment.getValue() > 0) {
             while (
-                (this.evaluate(new Expr.Variable(counterName)) as Int32 | Float)
+                (this.unboxIfNumber(this.evaluate(new Expr.Variable(counterName))) as Int32 | Float)
                     .greaterThan(finalValue)
                     .not()
                     .toBoolean()
@@ -1493,7 +1546,10 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
             }
         } else {
             while (
-                (this.evaluate(new Expr.Variable(counterName)) as Int32 | Float).lessThan(finalValue).not().toBoolean()
+                (this.unboxIfNumber(this.evaluate(new Expr.Variable(counterName))) as Int32 | Float)
+                    .lessThan(finalValue)
+                    .not()
+                    .toBoolean()
             ) {
                 // execute the block
                 try {
@@ -1582,7 +1638,7 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
     }
 
     visitWhile(statement: Stmt.While): BrsType {
-        while (this.evaluate(statement.condition).equalTo(BrsBoolean.True).toBoolean()) {
+        while (this.evaluateCondition(statement.condition)) {
             try {
                 this.execute(statement.body);
             } catch (reason) {
@@ -1601,12 +1657,12 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
     }
 
     visitIf(statement: Stmt.If): BrsType {
-        if (this.evaluate(statement.condition).equalTo(BrsBoolean.True).toBoolean()) {
+        if (this.evaluateCondition(statement.condition)) {
             this.execute(statement.thenBranch);
             return BrsInvalid.Instance;
         } else {
             for (const elseIf of statement.elseIfs || []) {
-                if (this.evaluate(elseIf.condition).equalTo(BrsBoolean.True).toBoolean()) {
+                if (this.evaluateCondition(elseIf.condition)) {
                     this.execute(elseIf.thenBranch);
                     return BrsInvalid.Instance;
                 }
@@ -1708,7 +1764,7 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
         let current: BrsType = source;
         for (let i = 0; i < statement.indexes.length; i++) {
             let index = this.evaluate(statement.indexes[i]);
-            if (!isBrsNumber(index)) {
+            if (!isAnyNumber(index)) {
                 this.addError(new RuntimeError(RuntimeErrorDetail.NonNumericArrayIndex, statement.indexes[i].location));
             }
 
@@ -2005,7 +2061,11 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
      */
     private checkDebugger(statement: Stmt.Statement) {
         if (this.debugMode === DebugMode.EXIT) {
-            return;
+            // EXIT can be entered outside the statement loop — e.g. `roMessagePort.wait`
+            // consumes the EXIT command, sets the mode and *returns* (it cannot throw
+            // through the callable boundary). Without unwinding here the app's message
+            // loop would keep executing (`wait` now returns instantly) and spin forever.
+            throw new Stmt.BlockEnd("debug-exit", statement.location);
         }
         const inDebugSession = this.debugMode !== DebugMode.NONE;
         const cmd = BrsDevice.checkBreakCommand(inDebugSession);
@@ -2326,5 +2386,29 @@ export class Interpreter implements Expr.Visitor<BrsType>, Stmt.Visitor<BrsType>
             return value.lessThan(compare);
         }
         return value < compare;
+    }
+
+    /**
+     * Unboxes boxed numeric components (roInt, roFloat, …) to their intrinsic value;
+     * returns any other value unchanged.
+     * @param value Value to unbox
+     * @returns The intrinsic number, or the original value
+     */
+    private unboxIfNumber(value: BrsType): BrsType {
+        return isBoxedNumber(value) ? value.unbox() : value;
+    }
+
+    /**
+     * Evaluates an `if`/`while` condition expression to a JS boolean. Boxed numbers
+     * (roInt, roFloat, …) are unboxed first so they truth-test like their intrinsic
+     * values, matching Roku (e.g. `if node.someIntField` where the field read returns
+     * a boxed roInt) — their `equalTo` only compares against the same class. roBoolean
+     * needs no unboxing: its `equalTo` already handles intrinsic booleans and numbers.
+     * @param condition The condition expression to evaluate
+     * @returns The truthiness of the condition
+     */
+    private evaluateCondition(condition: Expr.Expression): boolean {
+        const value = this.unboxIfNumber(this.evaluate(condition));
+        return value.equalTo(BrsBoolean.True).toBoolean();
     }
 }

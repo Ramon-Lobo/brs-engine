@@ -18,11 +18,11 @@ describe("end to end brightscript functions", () => {
 
     afterEach(() => {
         clock.uninstall();
-        jest.resetAllMocks();
+        vi.clearAllMocks();
     });
 
     afterAll(() => {
-        jest.restoreAllMocks();
+        vi.restoreAllMocks();
         process.env = OLD_ENV;
     });
 
@@ -72,6 +72,14 @@ describe("end to end brightscript functions", () => {
             "saved key after accessing by dot: dd",
             "saved key after accessing by index: Dd",
             "AA keys size:  1",
+            "values() count:  3",
+            "values() in key order: Los Angeles, Chicago, New York",
+            "missing items reads invalid: true",
+            "missing keys reads invalid: true",
+            "items() still callable:  2",
+            "key bracket call still works: passed",
+            "methods in bracket returns invalid: invalid",
+            "methods in bracket raise error: Function Call Operator ( ) attempted on non-function.",
         ]);
     });
 
@@ -356,6 +364,8 @@ describe("end to end brightscript functions", () => {
             "can return seconds from date until now:  372649229",
             "can return seconds from date until now:  346383629",
             "can return 2077252342 for date that can't be parsed:  2077252342",
+            "total milliseconds long:  0",
+            "total microseconds long:  0",
         ]);
     });
 
@@ -398,6 +408,9 @@ describe("end to end brightscript functions", () => {
                     `    option1: ".value"\n` +
                     `    option2: "other"\n` +
                     `}`,
+                "false",
+                "false",
+                "false",
                 `<Component: roList> =\n(\n    "Transient"\n)`,
                 " 32723",
             ]);
@@ -597,7 +610,7 @@ describe("end to end brightscript functions", () => {
             "false",
             "false",
             "false",
-            "false",
+            "true",
         ]);
     });
 
@@ -800,6 +813,21 @@ describe("end to end brightscript functions", () => {
             "<Component: roArray> =\n[\n    4\n    5\n    6\n]",
             '<Component: roAssociativeArray> =\n{\n    key: "value"\n}',
             "<Component: roInvalid>",
+            "isNumber int: true",
+            "isNumber boxed float: true",
+            "isNumber invalid: false",
+            "isNumber string: false",
+            "isString str: true",
+            "isString boxed str: true",
+            "isString int: false",
+            "isFloatingPoint float: true",
+            "isFloatingPoint boxed float: true",
+            "isFloatingPoint double: true",
+            "isFloatingPoint int: false",
+            "hasComponent roArray: true",
+            "hasComponent rodeviceinfo: true",
+            "hasComponent roSGNode: true",
+            "hasComponent roBogus: false",
         ]);
     });
 });

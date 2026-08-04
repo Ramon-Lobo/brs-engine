@@ -126,7 +126,11 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
                 this.boundingRect,
                 this.localBoundingRect,
                 this.sceneBoundingRect,
+                this.subBoundingRect,
+                this.localSubBoundingRect,
+                this.sceneSubBoundingRect,
                 this.ancestorBoundingRect,
+                this.ancestorSubBoundingRect,
             ],
             ifSGNodeHttpAgentAccess: [this.getHttpAgent, this.setHttpAgent],
         });
@@ -183,7 +187,13 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
     abstract getValues(): BrsType[];
     abstract setValue(index: string, value: BrsType, alwaysNotify?: boolean, kind?: FieldKind, sync?: boolean): void;
     abstract setValueSilent(fieldName: string, value: BrsType, alwaysNotify?: boolean): void;
-    abstract addNodeField(fieldName: string, type: string, alwaysNotify: boolean, sync: boolean): void;
+    abstract addNodeField(
+        fieldName: string,
+        type: string,
+        alwaysNotify: boolean,
+        sync: boolean,
+        silent?: boolean
+    ): void;
     abstract getAddress(): string;
     abstract setAddress(address: string): void;
     abstract getOwner(): number;
@@ -212,7 +222,7 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
     protected abstract getFieldByRef(fieldName: string): RoAssociativeArray | string;
     protected abstract updateFields(interpreter: Interpreter, content: BrsType, createFields: boolean): void;
     protected abstract appendNodeFields(fieldsToAppend: BrsType): void;
-    protected abstract setNodeFields(fieldsToAppend: BrsType, addFields?: boolean): void;
+    protected abstract setNodeFields(fieldsToAppend: BrsType, addFields?: boolean, silent?: boolean): void;
     protected abstract removeFieldEntry(fieldName: string): boolean;
     protected abstract getNodeFieldsAsAA(): RoAssociativeArray;
     protected abstract getNodeFieldTypes(): RoAssociativeArray;
@@ -229,6 +239,7 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
     protected abstract findRootNode(start?: RoSGNode): RoSGNode;
 
     protected abstract getBoundingRect(type: string, interpreter?: Interpreter): Rect;
+    protected abstract getSubBoundingRect(type: string, itemNumber: string, interpreter?: Interpreter): Rect;
     protected abstract compareNodes(other: RoSGNode): boolean;
     protected abstract getThreadInfo(): RoAssociativeArray;
 
@@ -442,6 +453,13 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
             impl: (interpreter: Interpreter, fieldName: BrsString, type: BrsString, alwaysNotify: BrsBoolean) => {
                 const remote = this.rendezvousCall(interpreter, "addField", [fieldName, type, alwaysNotify]);
                 if (remote !== undefined) {
+                    // Mirror the field on this thread's copy: subsequent local reads/writes consult
+                    // hasNodeField before rendezvousing, so without the mirror a field added through
+                    // a rendezvous stays invisible here (set fails, get returns invalid). The mirror is
+                    // silent — the owning thread already notified observers and fanned the change out,
+                    // so notifying/re-syncing here would double-fire (e.g. a parentField observer that
+                    // counts content rows would over-count).
+                    this.addNodeField(fieldName.getValue(), type.getValue(), alwaysNotify.toBoolean(), true, true);
                     return remote;
                 }
                 this.location = interpreter.formatLocation();
@@ -461,6 +479,11 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
             impl: (interpreter: Interpreter, fields: RoAssociativeArray) => {
                 const remote = this.rendezvousCall(interpreter, "addFields", [fields]);
                 if (remote !== undefined) {
+                    // Mirror the fields on this thread's copy (see addField) — silently, so the local
+                    // copy is visible without re-notifying observers already notified by the owner.
+                    if (fields instanceof RoAssociativeArray) {
+                        this.setNodeFields(fields, true, true);
+                    }
                     return remote;
                 }
                 if (!(fields instanceof RoAssociativeArray)) {
@@ -887,6 +910,8 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
             impl: (interpreter: Interpreter, fieldName: BrsString) => {
                 const remote = this.rendezvousCall(interpreter, "removeField", [fieldName]);
                 if (remote !== undefined) {
+                    // Mirror the removal on this thread's copy (see addField).
+                    this.removeFieldEntry(fieldName.getValue());
                     return remote;
                 }
                 this.removeFieldEntry(fieldName.getValue());
@@ -905,6 +930,14 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
             impl: (interpreter: Interpreter, fieldNames: RoArray) => {
                 const remote = this.rendezvousCall(interpreter, "removeFields", [fieldNames]);
                 if (remote !== undefined) {
+                    // Mirror the removals on this thread's copy (see addField).
+                    if (fieldNames instanceof RoArray) {
+                        for (const fieldName of fieldNames.getElements()) {
+                            if (isBrsString(fieldName)) {
+                                this.removeFieldEntry(fieldName.getValue());
+                            }
+                        }
+                    }
                     return remote;
                 }
                 if (!(fieldNames instanceof RoArray)) {
@@ -1538,6 +1571,57 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
         });
     }
 
+    /* Returns the bounding rectangle of an identified sub part, in the parent's coordinate system. */
+    protected get subBoundingRect(): Callable {
+        return new Callable("subBoundingRect", {
+            signature: {
+                args: [new StdlibArgument("itemNumber", ValueKind.String)],
+                returns: ValueKind.Dynamic,
+            },
+            impl: (interpreter: Interpreter, itemNumber: BrsString) => {
+                const remote = this.rendezvousCall(interpreter, "subBoundingRect", [itemNumber]);
+                if (remote !== undefined) {
+                    return remote;
+                }
+                return toAssociativeArray(this.getSubBoundingRect("toParent", itemNumber.getValue(), interpreter));
+            },
+        });
+    }
+
+    /* Returns the bounding rectangle of an identified sub part, in the node's local coordinate system. */
+    protected get localSubBoundingRect(): Callable {
+        return new Callable("localSubBoundingRect", {
+            signature: {
+                args: [new StdlibArgument("itemNumber", ValueKind.String)],
+                returns: ValueKind.Dynamic,
+            },
+            impl: (interpreter: Interpreter, itemNumber: BrsString) => {
+                const remote = this.rendezvousCall(interpreter, "localSubBoundingRect", [itemNumber]);
+                if (remote !== undefined) {
+                    return remote;
+                }
+                return toAssociativeArray(this.getSubBoundingRect("local", itemNumber.getValue(), interpreter));
+            },
+        });
+    }
+
+    /* Returns the bounding rectangle of an identified sub part, in the Scene's coordinate system. */
+    protected get sceneSubBoundingRect(): Callable {
+        return new Callable("sceneSubBoundingRect", {
+            signature: {
+                args: [new StdlibArgument("itemNumber", ValueKind.String)],
+                returns: ValueKind.Dynamic,
+            },
+            impl: (interpreter: Interpreter, itemNumber: BrsString) => {
+                const remote = this.rendezvousCall(interpreter, "sceneSubBoundingRect", [itemNumber]);
+                if (remote !== undefined) {
+                    return remote;
+                }
+                return toAssociativeArray(this.getSubBoundingRect("toScene", itemNumber.getValue(), interpreter));
+            },
+        });
+    }
+
     /* Returns the bounding rectangle in relation to an ancestor component. */
     protected get ancestorBoundingRect(): Callable {
         return new Callable("ancestorBoundingRect", {
@@ -1564,6 +1648,39 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
                     ancestorRect.y += nodeRect.y;
                 }
                 return ancestorFound ? toAssociativeArray(ancestorRect) : toAssociativeArray(boundingRect);
+            },
+        });
+    }
+
+    /* Returns the bounding rectangle of an identified sub part, in relation to an ancestor component. */
+    protected get ancestorSubBoundingRect(): Callable {
+        return new Callable("ancestorSubBoundingRect", {
+            signature: {
+                args: [
+                    new StdlibArgument("itemNumber", ValueKind.String),
+                    new StdlibArgument("ancestor", ValueKind.Object),
+                ],
+                returns: ValueKind.Dynamic,
+            },
+            impl: (interpreter: Interpreter, itemNumber: BrsString, ancestor: RoSGNode) => {
+                const remote = this.rendezvousCall(interpreter, "ancestorSubBoundingRect", [itemNumber, ancestor]);
+                if (remote !== undefined) {
+                    return remote;
+                }
+                const subRect = this.getSubBoundingRect("toParent", itemNumber.getValue(), interpreter);
+                const ancestorRect = { ...subRect };
+                let ancestorFound = false;
+                const path = this.createPath(this, false).slice(1);
+                for (const node of path) {
+                    if (ancestor === node) {
+                        ancestorFound = true;
+                        break;
+                    }
+                    const nodeRect = node.getBoundingRect("toParent", interpreter);
+                    ancestorRect.x += nodeRect.x;
+                    ancestorRect.y += nodeRect.y;
+                }
+                return ancestorFound ? toAssociativeArray(ancestorRect) : toAssociativeArray(subRect);
             },
         });
     }
@@ -1635,6 +1752,67 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
     }
 
     /**
+     * Whether anything above this node (or the node itself) roots a findNode search space.
+     *
+     * `ifSGNodeDict` scopes findNode to the descendants of the subject's *nearest component
+     * ancestor*, so a node with none — a plain node built with CreateObject and never attached —
+     * has no tree of its own to search, however many children it has. Device-confirmed: a detached
+     * `Node` holding ten `ContentNode` children returns `invalid` for its own child's id.
+     *
+     * The Scene counts as a component root, which is what keeps the global node searchable: its
+     * parent is the Scene, so the Scene's subtree is its search space.
+     * @returns True when a component ancestor exists.
+     */
+    private hasComponentAncestor(): boolean {
+        // Widened so the identity check type-checks against the polymorphic `this`.
+        const scene: RoSGNode | undefined = sgRoot.scene;
+        const rootsComponent = (node: RoSGNode) =>
+            node === scene || sgRoot.nodeDefMap.has(node.nodeSubtype.toLowerCase());
+
+        if (rootsComponent(this)) {
+            return true;
+        }
+        let ancestor: RoSGNode | BrsInvalid = this.getNodeParent();
+        while (ancestor instanceof RoSGNode) {
+            if (rootsComponent(ancestor)) {
+                return true;
+            }
+            ancestor = ancestor.getNodeParent();
+        }
+        return false;
+    }
+
+    /**
+     * Resolves a findNode miss against the component scope the subject node belongs to.
+     *
+     * A device does not rely on the parent chain alone: a node created inside a component's script
+     * and never attached still reaches that component's tree (device-confirmed — a detached plain
+     * `Group` built in a Scene's script finds the Scene's children). The owning scope is
+     * approximated by the component whose script is currently executing, which the environment
+     * already tracks as `hostNode`; a node is nearly always created and used within one component,
+     * and no per-node creation link has to be stored to get there.
+     *
+     * Only applies to a detached node that is not itself a custom component root — such a node is
+     * its own scope on a device and must never borrow the caller's.
+     * @param interpreter Calling interpreter, carrying the executing component in its environment.
+     * @param id Node id being searched for.
+     * @returns The matching node, or invalid when the subject has no separate component scope.
+     */
+    private findInComponentScope(interpreter: Interpreter, id: string): RoSGNode | BrsInvalid {
+        if (this.getNodeParent() instanceof RoSGNode) {
+            return BrsInvalid.Instance;
+        }
+        if (sgRoot.nodeDefMap.has(this.nodeSubtype.toLowerCase())) {
+            return BrsInvalid.Instance;
+        }
+        const host = interpreter.environment.hostNode;
+        if (!(host instanceof RoSGNode) || host === this) {
+            return BrsInvalid.Instance;
+        }
+        return this.findNodeById(this.findRootNode(host), id);
+    }
+
+    /**
      * Returns the node that is a descendant of the nearest component ancestor of the subject node whose id field matches the given name,
      * otherwise return invalid.
      * Implemented as a DFS from the top of parent hierarchy to match the observed behavior as opposed to the BFS mentioned in the docs.
@@ -1652,11 +1830,30 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
                 }
                 const id = name.getValue();
                 if (id.trim() === "") return BrsInvalid.Instance;
-                // perform search to child nodes
-                let node = this.findNodeById(this, id);
+                // The search space is the subject node's nearest component ancestor. The global
+                // node's is the Scene, and the global node itself sits *outside* the Scene's
+                // children, so its own descendants are not in that space: a device does not find a
+                // node appended to m.global via m.global.findNode(). Skipping the self-search keeps
+                // that boundary — every other node's subtree is part of its ancestor's anyway, so
+                // searching it first is only a shortcut.
+                if (!this.hasComponentAncestor()) {
+                    // Nothing roots a search space above this node, so its own tree is not one
+                    // either — a device returns invalid for `detachedNode.findNode(<its own child>)`.
+                    // `findRootNode()` would just hand back the subject, so skip both walks and let
+                    // only the executing component's scope apply.
+                    return this.findInComponentScope(interpreter, id);
+                }
+                // Widened to RoSGNode so the comparison type-checks: `sgRoot.mGlobal` is a `Global`,
+                // which TypeScript sees as having no overlap with the polymorphic `this`.
+                const globalNode: RoSGNode = sgRoot.mGlobal;
+                const searchSelf: boolean = globalNode !== this;
+                let node: RoSGNode | BrsInvalid = searchSelf ? this.findNodeById(this, id) : BrsInvalid.Instance;
                 if (node instanceof BrsInvalid) {
                     // if not found, search from root
                     node = this.findNodeById(this.findRootNode(), id);
+                }
+                if (node instanceof BrsInvalid) {
+                    node = this.findInComponentScope(interpreter, id);
                 }
                 return node;
             },
@@ -1691,18 +1888,18 @@ export abstract class RoSGNode extends BrsComponent implements BrsValue, ISGNode
         return new Callable("parentSubtype", {
             signature: {
                 args: [new StdlibArgument("nodeType", ValueKind.String)],
-                returns: ValueKind.Object,
+                returns: ValueKind.String,
             },
             impl: (interpreter: Interpreter, nodeType: BrsString) => {
                 const remote = this.rendezvousCall(interpreter, "parentSubtype", [nodeType]);
                 if (remote !== undefined) {
                     return remote;
                 }
+                // Per the Roku docs this always returns a String - callers (e.g. the
+                // rokucommunity/promises library's isPromise()) walk the hierarchy checking
+                // for "" to detect the root, so returning Invalid here crashes them.
                 const parentType = subtypeHierarchy.get(nodeType.getValue().toLowerCase());
-                if (parentType) {
-                    return new BrsString(parentType);
-                }
-                return BrsInvalid.Instance;
+                return new BrsString(parentType ?? "");
             },
         });
     }

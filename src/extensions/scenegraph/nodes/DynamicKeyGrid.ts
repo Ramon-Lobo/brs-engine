@@ -15,14 +15,18 @@ import {
 import { FieldKind, FieldModel } from "../SGTypes";
 import { SGNodeType } from ".";
 import { Group } from "./Group";
-import { Node } from "./Node";
 import { Font } from "./Font";
 import { sgRoot } from "../SGRoot";
+import { sgClock } from "../SGClock";
 import { jsValueOf } from "../factory/Serializer";
 import { computeLayout, KeyInset, keyboardSize, KeyLayout, RenderedKey, resolveKeyIcon } from "./kdf/KeyDefinition";
 
-/** Default palette colors used when no RSGPalette is found in the scene graph. */
-const DEFAULT_PALETTE: Record<string, number> = {
+/**
+ * Default keyboard palette colors used when no RSGPalette is found in the scene graph (the gray
+ * background / white text default from the DynamicKeyGrid spec). Shared with DynamicKeyboardBase so
+ * the key grid and the text edit box fall back to the same theme.
+ */
+export const DEFAULT_KEYBOARD_PALETTE: Record<string, number> = {
     KeyboardColor: 0xffffffff, // no tint applied to the keyboard background bitmap
     PrimaryTextColor: 0xffffffff,
     SecondaryItemColor: 0x808080ff,
@@ -168,7 +172,7 @@ export class DynamicKeyGrid extends Group {
         super.setValue("keyFocused", new BrsString(key?.out ?? ""));
         // Focus moved to a (possibly) different key: restart the hover dwell timer and
         // clear any pop-up suppression, so the timer applies again on the newly focused key.
-        this.lastFocusTime = Date.now();
+        this.lastFocusTime = sgClock.now();
         this.popupSuppressed = false;
     }
 
@@ -469,35 +473,27 @@ export class DynamicKeyGrid extends Group {
     // -------------------------------------------------------------------------
 
     private getPaletteColor(name: string): number {
-        let node: Node | undefined = this;
-        while (node) {
-            const palette = node.getValue("palette");
-            if (palette instanceof Node) {
-                const colors = palette.getValue("colors");
-                const value = (jsValueOf(colors) as Record<string, unknown>)?.[name];
-                if (typeof value === "number") {
-                    return value;
-                }
-            }
-            const parent = node.getNodeParent();
-            node = parent instanceof Node ? parent : undefined;
-        }
-        return DEFAULT_PALETTE[name];
+        // Palette resolution (walk this node's ancestors for the nearest RSGPalette) is a shared
+        // Node capability; the key grid only supplies its own per-color defaults.
+        return this.resolvePaletteColor(name, DEFAULT_KEYBOARD_PALETTE[name]);
     }
 
     // -------------------------------------------------------------------------
     // Rendering
     // -------------------------------------------------------------------------
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible()) {
             this.updateRenderTracking(true);
             return;
         }
-        const nodeTrans = this.getTranslation();
-        const drawTrans = nodeTrans.slice();
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const size = this.getDimensions();
         const rotation = angle + this.getRotation();
         opacity = opacity * this.getOpacity();
@@ -508,12 +504,13 @@ export class DynamicKeyGrid extends Group {
 
         // Auto-open a "hover" suggestion pop-up once the focus has dwelled on the key, unless it
         // was suppressed by a previous selection (until focus leaves and returns to the key).
-        if (showFocus && !this.popup && !this.popupSuppressed) {
+        // Paint-only: opening a popup mutates the tree, which a layout pass must never do.
+        if (showFocus && !this.popup && !this.popupSuppressed && this.isPaintPass(draw2D)) {
             const key = this.renderedKeys[this.focusIndex];
             if (
                 key?.suggestions &&
                 this.triggersInclude(key, "hover") &&
-                Date.now() - this.lastFocusTime > this.hoverDelay
+                sgClock.now() - this.lastFocusTime > this.hoverDelay
             ) {
                 this.openPopup(key);
             }

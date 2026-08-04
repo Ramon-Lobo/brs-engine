@@ -30,11 +30,14 @@ import {
 import { loadComponentLibrary } from "./parser/ComponentLibrary";
 import { sgRoot } from "./SGRoot";
 import { Task } from "./nodes/Task";
+import { Field } from "./nodes/Field";
+import { Node } from "./nodes/Node";
 import { initializeTask, createNode, updateTypeDefHierarchy, getNodeType } from "./factory/NodeFactory";
 import { RoSGScreen } from "./components/RoSGScreen";
 import { getRenderThreadQueue } from "./components/RoRenderThreadQueue";
 import packageInfo from "../../../packages/scenegraph/package.json";
 
+export * from "./SGClock";
 export * from "./SGRoot";
 export * from "./SGUtil";
 export * from "./components/RoSGNode";
@@ -53,6 +56,12 @@ export class BrightScriptExtension implements BrsExtension {
     readonly version = packageInfo.version;
 
     onInit() {
+        // Reset per-thread deferred observer-dispatch state so nothing leaks across app runs.
+        Field.resetDispatch();
+        Node.resetFocusDispatch();
+        // Mirrors Roku's `logrendezvous`. Set per thread (the render thread and every Task worker
+        // build their own extension instance), so a trace covers both ends of a rendezvous.
+        sgRoot.logRendezvous = BrsDevice.deviceInfo.logRendezvous === true;
         // Register SceneGraph components with BrsObjects so they can be created with CreateObject()
         BrsObjects.set("roSGScreen", () => new RoSGScreen(), 0);
         BrsObjects.set(
@@ -170,6 +179,12 @@ export class BrightScriptExtension implements BrsExtension {
         if (sgRoot.inTaskThread()) {
             const task = sgRoot.getCurrentThreadTask();
             task?.processThreadUpdate();
+        } else {
+            // Deliver focus notifications deferred during a component's init() from the message loop
+            // (once init has fully unwound), matching Roku dispatching them after init returns rather
+            // than synchronously at the end of init. Render-thread only — focus is a render-thread
+            // concern and Task threads never establish it. No-op unless there is pending work.
+            Field.deliverPendingInitFocus();
         }
     }
 

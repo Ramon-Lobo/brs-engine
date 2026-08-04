@@ -10,7 +10,7 @@ An interpreter for the BrightScript language that runs as a CLI and Roku apps in
 
 ## Overview
 
-The **BrightScript Simulation Engine** provides a complete a set of libraries and a command-line interface for executing, testing, and packaging [Roku apps](https://developer.roku.com/overview) on Node.js platforms. Perfect for automation, CI/CD pipelines, development workflows, and server-side BrightScript execution.
+The **BrightScript Simulation Engine** provides a complete BrightScript interpreter, bundled as a set of libraries and a command-line interface, for executing, testing, and packaging [Roku apps](https://developer.roku.com/develop) on Node.js platforms. Perfect for automation, CI/CD pipelines, development workflows, and server-side BrightScript execution.
 
 > 🚨 Important:
 >
@@ -26,12 +26,13 @@ The **BrightScript Simulation Engine** provides a complete a set of libraries an
 - **File Execution** - Run `.brs`, `.zip`, and `.bpk` files directly
 - **Folder Execution** - Run BrightScript apps from a folder
 - **App Packaging** - Create encrypted `.bpk` packages from `.zip` files
-- **ASCII Rendering** - Run Roku apps using ASCII rendering in the terminal
+- **Terminal Screen Rendering** - Show the app screen as ASCII art, Unicode blocks or real images (iTerm2/Kitty)
+- **Interactive Control** - Keyboard remote control, PNG screenshots (Ctrl+S) and text output logging to file
 - **Batch Processing** - Execute multiple files and automate workflows
 
 ### ⚙️ BrightScript Interpreter
 
-- Full BrightScript language interpreter, with specs aligned up to Roku OS 15.0
+- Full BrightScript language interpreter, with specs aligned up to Roku OS 15.3
 - **Draw 2D API** - Full support for the BrightScript 2D drawing components
 - **SceneGraph Framework** - Experimental support for the Roku SceneGraph components (see section below)
 - **Video Playback** - Via `roVideoPlayer` and `Video` node
@@ -43,20 +44,25 @@ The **BrightScript Simulation Engine** provides a complete a set of libraries an
 - **Screen resolutions** - Support for various Roku display modes
 - **Input Handling** - Keyboard and gamepad simulation for remote control input, see [docs](https://github.com/lvcabral/brs-engine/blob/master/docs/remote-control.md) for more details
 - **File System Simulation** - Including `pkg:/`, `tmp:/`, `cachefs:/`, `common:/` and `ext1:/` volumes
-- **Registry simulation** - Roku device registry emulation saved on browser local storage
+- **Registry simulation** - Roku device registry emulation, persisted to a local `registry.json` in the user data folder when `--registry` is used
 - **Micro Debugger** - Step-through debugging capabilities, similar to the Roku experience
-- **ECP Server** - [External Control Protocol](https://developer.roku.com/docs/developer-program/dev-tools/external-control-api.md) for remote control
+- **ECP Server** - [External Control Protocol](https://developer.roku.com/dev/docs/external-control-api) for remote control
 - **SSDP Discovery** - Device discovery simulation
 - **Localization** - Language and region settings
 - **Customization** - You can customize device features and behaviors, see [docs](https://github.com/lvcabral/brs-engine/blob/master/docs/customization.md) for more details
 
 ## SceneGraph Extension
 
-The [`brs-scenegraph`](https://www.npmjs.com/package/brs-scenegraph) extension is integrated to the `brs-node` package by default. The CLI app loads it so the REPL and apps can run SceneGraph without additional setup. Use the `--no-sg` flag if you want to disable it for a given CLI session. For your Node.js apps register it manually by calling `registerExtension(() => new BrightScriptExtension())`. Refer to [extensions guide](https://github.com/lvcabral/brs-engine/blob/master/docs/extensions.md) for more information about the extension package.
+The [`brs-scenegraph`](https://www.npmjs.com/package/brs-scenegraph) extension is bundled with the `brs-node` package (as `bin/brs-sg.node.js`). The CLI loads it automatically so the REPL and apps can run SceneGraph without additional setup — use the `--no-sg` flag to disable it for a given CLI session. When embedding the library:
+
+- With the synchronous `executeFile`, register it in-process: `registerExtension(() => new BrightScriptExtension())`.
+- With the worker-based `executeApp`, declare it on the payload (`payload.extensions` + `payload.device.extensions`) so every worker thread loads its own instance — see the [Node.js library guide](https://github.com/lvcabral/brs-engine/blob/master/docs/using-node-library.md#running-apps-on-worker-threads-with-scenegraph-task-support).
+
+Refer to the [extensions guide](https://github.com/lvcabral/brs-engine/blob/master/docs/extensions.md) for more information about the extension architecture.
 
 > ⚠️ Note:
 >
-> **SceneGraph** extension is currently under development, with pre-release **alpha** versions available for testing. See the current state of the SceneGraph implementation and other limitations of the **engine** in the [Current Limitations](https://github.com/lvcabral/brs-engine/blob/master/docs/limitations.md) document.
+> **SceneGraph** extension is mostly complete, with **beta** versions available for testing. See the current state of the SceneGraph implementation and other limitations of the **engine** in the [Current Limitations](https://github.com/lvcabral/brs-engine/blob/master/docs/limitations.md) document.
 
 ## Installation
 
@@ -79,8 +85,17 @@ The package libraries require Node.js v22 or higher, and are organized as follow
 | Library File | Description |
 | --- | --- |
 | `bin/brs.cli.js` | Executable **[CLI](https://github.com/lvcabral/brs-engine/blob/master/docs/run-as-cli.md)** application that can be used from the terminal |
-| `bin/brs.node.js` | A NodeJS library, that exposes the language interpreter to be used by Node.js applications |
-| `bin/brs.ecp.js` | A **[NodeJS Worker](https://nodejs.org/api/worker_threads.html)** library, used by the CLI to launch the [ECP](https://developer.roku.com/docs/developer-program/dev-tools/external-control-api.md) and **SSDP** services. |
+| `bin/brs.node.js` | The engine library (the package `main`): exposes the interpreter to Node.js applications, and is also the **worker entry** used to run apps and SceneGraph Tasks on [worker threads](https://nodejs.org/api/worker_threads.html) |
+| `bin/brs.ecp.js` | A **worker thread** library, used by the CLI to launch the [ECP](https://developer.roku.com/dev/docs/external-control-api) and **SSDP** services |
+| `bin/brs-sg.node.js` | The [SceneGraph extension](https://www.npmjs.com/package/brs-scenegraph) bundle, loaded dynamically into the engine (and into each worker thread) when SceneGraph support is needed |
+
+#### How the libraries relate
+
+- **`brs.node.js` is the core** — everything else plugs into it. It offers two execution models:
+  - `executeFile(payload)` runs the interpreter **synchronously on the calling thread** — ideal for tests, CI and scripting. SceneGraph `Task` nodes do not spawn in this mode.
+  - `executeApp(payload)` runs the app on a dedicated **worker thread** and spawns one worker per running SceneGraph `Task`, mirroring the browser engine and a real Roku device. The worker entry is `brs.node.js` itself.
+- **`brs-sg.node.js` is deliberately a separate bundle** (not compiled into the core): the interpreter stays SceneGraph-agnostic and loads it through the public extension API — the same contract available to third-party extensions. It binds to the running engine at load time (its `brs-engine` import resolves to the already-loaded `brs.node.js` module), so both must always come from the **same package version**. The CLI loads it automatically (`--no-sg` disables); library consumers register it per the examples in the [Node.js library guide](https://github.com/lvcabral/brs-engine/blob/master/docs/using-node-library.md).
+- **`brs.cli.js` is a consumer of the other three**: it requires `brs.node.js` for execution, loads `brs-sg.node.js` for SceneGraph apps, and spawns `brs.ecp.js` as a worker when `--ecp` is passed.
 
 ## Documentation
 
@@ -103,7 +118,7 @@ Learn how to use the package and its libraries by reading the documents below:
 - My threads: [@lvcabral](https://www.threads.net/@lvcabral)
 - My Bluesky: [@lvcabral.com](https://bsky.app/profile/lvcabral.com)
 - My X/twitter: [@lvcabral](https://twitter.com/lvcabral)
-- My podcast: [PODebug Podcast](http://podebug.com)
+- My podcast: [PODebug Podcast](https://podebug.com)
 - Check my other [GitHub repositories](https://github.com/lvcabral)
 
 ## License

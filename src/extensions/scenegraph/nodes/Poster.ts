@@ -14,7 +14,6 @@ import {
 } from "brs-engine";
 import { Group } from "./Group";
 import { sgRoot } from "../SGRoot";
-import { rotateTranslation } from "../SGUtil";
 import { brsValueOf, jsValueOf } from "../factory/Serializer";
 
 export class Poster extends Group {
@@ -63,12 +62,23 @@ export class Poster extends Group {
                 this.setValueSilent("bitmapWidth", new Float(0));
                 this.setValueSilent("bitmapHeight", new Float(0));
                 this.uri = uri;
+                // Commit the uri field BEFORE the (synchronous) load and the loadStatus
+                // notification below, so that when the resulting loadStatus="ready"/"failed"
+                // change is observed, .uri already holds the new value — matching Roku, where the
+                // uri field is set before the asynchronous image load completes. Apps commonly
+                // preload an image on an off-screen Poster and, in its loadStatus observer, copy
+                // .uri onto a visible Poster and then clear the preloader's uri; if the uri were
+                // committed only afterwards (the trailing super.setValue), that clear would be
+                // clobbered by the deferred write and the real image would revert to a placeholder.
+                // Returning here avoids that trailing re-commit.
+                super.setValue(index, value, alwaysNotify, kind);
                 const loadStatus = this.loadUri(uri);
                 if (loadStatus !== "ready") {
                     const failedUri = this.getValueJS("failedBitmapUri") as string;
                     this.loadUri(failedUri);
                 }
                 super.setValue("loadStatus", new BrsString(loadStatus));
+                return;
             } else if (typeof uri !== "string" || uri.trim() === "") {
                 this.uri = "";
                 this.bitmap = undefined;
@@ -90,15 +100,18 @@ export class Poster extends Group {
         super.setValue(index, value, alwaysNotify, kind);
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible()) {
             this.updateRenderTracking(true);
             return;
         }
-        const nodeTrans = this.getTranslation();
-        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const size = this.getDimensions();
         const loadStatus = this.getValueJS("loadStatus") as string;
         const rect = { x: drawTrans[0], y: drawTrans[1], width: size.width, height: size.height };
@@ -116,9 +129,17 @@ export class Poster extends Group {
                 alpha = opacity * this.getValueJS("loadingBitmapOpacity");
             }
             this.bitmap.scaleMode = 1;
-            if (displayMode.trim().toLowerCase() === "scaletofit") {
+            // The aspect-preserving display modes do not apply to a 9-patch: its marker border is
+            // what declares which regions stretch (fixed corners are blitted 1:1), so the target
+            // rect is authoritative and the source aspect ratio is meaningless. Letterboxing it to
+            // the source ratio collapses a wide pill drawn from a square asset to a square the
+            // height of the rect — the app-assigned width is simply lost — and cropping it
+            // (scaleToZoom) slices through the markers. Same rationale as loadUri skipping
+            // loadWidth/loadHeight for 9-patches: the bitmap must reach drawNinePatch intact.
+            const mode = this.bitmap.ninePatch ? "noscale" : displayMode.trim().toLowerCase();
+            if (mode === "scaletofit") {
                 this.drawImage(this.bitmap, this.scaleToFit(rect), rotation, alpha, draw2D, rgba);
-            } else if (displayMode.trim().toLowerCase() === "scaletozoom") {
+            } else if (mode === "scaletozoom") {
                 draw2D?.doDrawCroppedBitmap(this.bitmap, this.scaleToZoom(rect), rect, rgba, alpha);
             } else {
                 this.drawImage(this.bitmap, rect, rotation, alpha, draw2D, rgba);

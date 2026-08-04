@@ -3,6 +3,7 @@ import {
     Interpreter,
     BrsDevice,
     BrsEvent,
+    BrsComponent,
     BrsInvalid,
     BrsString,
     BrsType,
@@ -17,15 +18,136 @@ import {
     isSyncAction,
     RuntimeError,
     RuntimeErrorDetail,
+    DataType,
+    LogLevel,
+    getNow,
 } from "brs-engine";
+import { sgClock } from "../SGClock";
 import { sgRoot } from "../SGRoot";
-import { brsValueOf, fromAssociativeArray, fromSGNode, jsValueOf, updateSGNode } from "../factory/Serializer";
+import {
+    brsValueOf,
+    collectPortNodeEvents,
+    dropPortNodeEvents,
+    fromSGNode,
+    jsValueOf,
+    SerializedPortEvent,
+    serializeTaskM,
+    updateSGNode,
+} from "../factory/Serializer";
 import { FieldKind, FieldModel, MethodCallPayload, isMethodCallPayload } from "../SGTypes";
 import { Node } from "./Node";
 import { ContentNode } from "./ContentNode";
 import { Global } from "./Global";
 import { SGNodeType } from ".";
 import type { Field, Scene } from "..";
+
+/**
+ * Maximum time (ms) a blocking rendezvous wait sleeps before re-checking cooperative conditions.
+ * `Atomics.wait` on the response buffer can't simultaneously watch the debug-halt slot, so a wait
+ * that would otherwise sleep for the full rendezvous timeout is capped to this interval; each wake
+ * re-checks `BrsDevice.pauseIfDebugging()` so the thread freezes promptly when the Micro Debugger
+ * activates on another thread instead of running out the clock and throwing a spurious timeout.
+ */
+const RENDEZVOUS_POLL_MS = 100;
+
+/** Fallback counter used only when no shared array is present (e.g. isolated unit tests). */
+let localRendezvousId = 0;
+
+/** Context captured by {@link Task.beginRendezvous} and consumed by {@link Task.endRendezvous}. */
+interface RendezvousCtx {
+    id: number;
+    file: string;
+    line: number;
+    startedMs: number;
+}
+
+/**
+ * Allocates the next id in the monotonic sequence Roku's SceneGraph debug console assigns to each
+ * `logrendezvous` crossing (`Rendezvous[N]`), shared by every thread via the control array so ids
+ * never collide across a Task and the render thread.
+ * @returns The id to print on this rendezvous' BLOCK/UNBLOCK lines.
+ */
+function nextRendezvousId(): number {
+    const shared = BrsDevice.sharedArray;
+    if (shared.length > DataType.RDN) {
+        return Atomics.add(shared, DataType.RDN, 1) + 1;
+    }
+    return ++localRendezvousId;
+}
+
+/**
+ * Countdown for a blocking rendezvous wait, measured against the render thread's liveness rather
+ * than wall time.
+ *
+ * Incoming requests are only served when the render thread reaches its message loop
+ * (`sgRoot.processTasks`), so app code that runs for longer than the timeout inside a single
+ * callback — a screen building hundreds of components, say — would otherwise fail a request the
+ * render thread has not had a chance to answer yet. The countdown therefore restarts whenever the
+ * render thread's heartbeat advances, and only expires when the render thread stops executing
+ * BrightScript altogether: dead, or blocked waiting on this thread. That is the deadlock the
+ * timeout exists to report; a busy render thread is a device-faithful wait, not a failure.
+ * @param timeoutMs Milliseconds of render-thread silence tolerated before the wait fails.
+ * @param label Describes the pending rendezvous for the one-shot "still waiting" warning.
+ * @returns A countdown exposing the remaining time and a restart for uncounted pauses.
+ */
+export function rendezvousDeadline(timeoutMs: number, label: () => string) {
+    const started = Date.now();
+    let beat = BrsDevice.readRenderHeartbeat();
+    let deadline = started + timeoutMs;
+    let warned = false;
+    return {
+        /**
+         * @returns Milliseconds left before the wait fails; positive while the render thread runs.
+         */
+        remaining(): number {
+            const current = BrsDevice.readRenderHeartbeat();
+            if (current !== beat) {
+                beat = current;
+                deadline = Date.now() + timeoutMs;
+                const elapsed = Date.now() - started;
+                if (!warned && elapsed > timeoutMs) {
+                    warned = true;
+                    BrsDevice.stderr.write(
+                        `warning,[task:${sgRoot.threadId}] Rendezvous ${label()} pending for ${elapsed}ms: ` +
+                            `the render thread is busy and has not reached its message loop`
+                    );
+                }
+            }
+            return deadline - Date.now();
+        },
+        /** Restarts the countdown, for time that must not be counted (e.g. a debug session). */
+        restart() {
+            beat = BrsDevice.readRenderHeartbeat();
+            deadline = Date.now() + timeoutMs;
+        },
+    };
+}
+
+/**
+ * Renders a field value for a rendezvous trace, but only when it is cheap and safe to print.
+ * Nodes and containers are reported by kind alone — stringifying a content tree inside the render
+ * loop would cost more than the trace is worth.
+ * @param value Value to describe.
+ * @returns A short printable form.
+ */
+function describeSimpleValue(value: BrsType): string {
+    if (value === undefined || value === null) {
+        return "undefined";
+    }
+    if (value.kind === undefined) {
+        return "?";
+    }
+    if (isBrsString(value)) {
+        return `"${value.getValue().slice(0, 24)}"`;
+    }
+    // Never stringify a component: `toString` on an array or AA renders every element (a whole
+    // content tree, worst case) and this runs inside the rendezvous round trip being measured, so
+    // printing the value would distort the very timings the trace exists to expose.
+    if (value instanceof BrsComponent) {
+        return `<${value.getComponentName()}>`;
+    }
+    return String(value.toString()).slice(0, 24);
+}
 
 /**
  * SceneGraph `Task` node implementation responsible for executing BrightScript in a worker thread.
@@ -70,6 +192,18 @@ export class Task extends Node {
     private syncRequestId: number = 1;
     /** Tracks acknowledgements completed by the main thread. */
     private readonly completedAcks: Set<number> = new Set();
+    /**
+     * Request ids of rendezvous field *reads* still awaiting a response.
+     *
+     * The owner answers a `get` with an update whose action is `set`, so the reply travels the same
+     * path as a genuine push and used to be applied with notification — making a read of a field
+     * indistinguishable from a change to it, and firing the reader's own observers. That is never
+     * right (a read fires nothing on a device) and it is actively destructive for a port observer:
+     * an AA- or array-valued field always compares unequal (`RoAssociativeArray.equalTo` is
+     * unconditionally false), so *every* read pushed a phantom event onto the port. An app driving a
+     * dispatch loop off such a port sees completions that never happened.
+     */
+    private readonly pendingReads: Set<number> = new Set();
 
     /**
      * Creates a Task node, registering default and initial fields.
@@ -118,9 +252,23 @@ export class Task extends Node {
             return;
         }
         super.setValue(index, value, alwaysNotify, kind);
+        // Re-resolve: `super.setValue` may have *created* the field (the `alwaysNotify !== undefined`
+        // branch), and the pre-`super` lookup above used `fields.get`, which misses lazily
+        // materialized/aliased fields. Capturing it before the call skipped the sync entirely.
+        const synced = this.resolveField(mapKey);
         // Notify other threads of field changes
-        if (field && sync && this.changed) {
-            this.syncRemoteField(mapKey, field.getValue(false));
+        if (synced && sync && this.changed) {
+            const ownTask = sgRoot.getCurrentThreadTask();
+            if (ownTask && ownTask !== this && this.shouldRendezvous()) {
+                // A *foreign* Task node — another task's node, typically reached through `m.global`.
+                // This copy was never activated on this thread, so it has no thread of its own
+                // (`threadId < 0`) and its own `syncRemoteField` would drop the write silently. Send
+                // it out through the current thread's channel, addressed at the target node, exactly
+                // as `Node.rendezvousSet` does for non-Task nodes.
+                ownTask.syncRemoteField(mapKey, synced.getValue(false), this.syncType, this.address);
+            } else {
+                this.syncRemoteField(mapKey, synced.getValue(false));
+            }
             this.changed = false;
         }
     }
@@ -197,19 +345,24 @@ export class Task extends Node {
         if (!responseBuffer || update.requestId === undefined) {
             return false;
         }
-        const deadline = Date.now() + timeoutMs;
+        const countdown = rendezvousDeadline(timeoutMs, () => `set ${update.type}.${update.key}`);
         while (true) {
             if (this.completedAcks.delete(update.requestId)) {
                 return true;
             }
-            const remaining = deadline - Date.now();
+            if (BrsDevice.pauseIfDebugging()) {
+                // Frozen for a debug session on another thread; debug time must not count toward
+                // the rendezvous timeout, and the request has already been sent (do not re-send).
+                countdown.restart();
+                continue;
+            }
+            const remaining = countdown.remaining();
             if (remaining <= 0) {
                 break;
             }
-            const waitResult = responseBuffer.waitVersion(0, remaining);
-            if (waitResult === "timed-out") {
-                break;
-            }
+            // Cap the sleep so the loop re-checks pauseIfDebugging even if the debugger activates
+            // after we entered the wait; the real timeout is enforced by the `remaining` check above.
+            responseBuffer.waitVersion(0, Math.min(remaining, RENDEZVOUS_POLL_MS));
             this.processThreadUpdate(responseBuffer);
         }
         throw this.rendezvousTimeoutError("set", update.type, update.key);
@@ -217,8 +370,11 @@ export class Task extends Node {
 
     /**
      * Builds the runtime error raised when a rendezvous is not served within the configured timeout.
-     * On a real device this corresponds to a blocked render thread, which terminates the app; here it
-     * surfaces as an `ExecutionTimeout` runtime error instead of silently returning `invalid`.
+     * The countdown tracks the render thread's heartbeat (see {@link rendezvousDeadline}), so this
+     * only fires once the render thread has stopped executing BrightScript altogether — never merely
+     * because it is slow. On a real device that corresponds to a blocked render thread, which
+     * terminates the app; here it surfaces as an `ExecutionTimeout` runtime error instead of silently
+     * returning `invalid`.
      * @param action Rendezvous action that timed out (`get`, `set`, or `call`).
      * @param type Sync type domain of the target node.
      * @param key Field or method name involved in the rendezvous.
@@ -283,6 +439,9 @@ export class Task extends Node {
             };
             postMessage(taskData);
             this.started = false;
+            // The task consumed its events live while running; drop the render-side copies so a
+            // restart doesn't replay the whole previous run as pre-launch events.
+            dropPortNodeEvents(this.m);
         }
         this.active = false;
     }
@@ -356,7 +515,14 @@ export class Task extends Node {
         if (this.threadId < 0 || !this.active) {
             return;
         }
-        const value = fieldValue instanceof Node ? fromSGNode(fieldValue, true) : jsValueOf(fieldValue);
+        // A node crossing task → render changes owner (below), so the receiver runs callFunc against
+        // its own copy and needs the script-scope `m` that init() populated here. Every other path
+        // leaves the owner unchanged, and a callFunc on a node owned elsewhere rendezvouses to that
+        // owner (device-confirmed), so shipping `m` there would only bloat the payload.
+        const value =
+            fieldValue instanceof Node
+                ? fromSGNode(fieldValue, true, undefined, undefined, { scriptScope: this.inThread })
+                : jsValueOf(fieldValue);
         if (fieldValue instanceof Node) {
             // Re-own to the render thread only when the node actually crosses task → render (a task
             // setting a field). On the render side this is a fan-out (render → task): the node stays
@@ -455,31 +621,42 @@ export class Task extends Node {
             value: null,
             requestId,
         };
-        const started = sgRoot.logRendezvous ? Date.now() : 0;
+        const rdzCtx = this.beginRendezvous("get", type, fieldName);
+        // Mark before sending: the reply is applied inside `processThreadUpdate` below, which has to
+        // recognise it as a read and store the value without notifying observers.
+        this.pendingReads.add(requestId);
         this.sendThreadUpdate(request);
-        const deadline = Date.now() + timeoutMs;
+        const countdown = rendezvousDeadline(timeoutMs, () => `get ${type}.${fieldName}`);
         const responseBuffer = this.directBuffer ?? this.taskBuffer;
 
         while (true) {
             const update = this.processThreadUpdate(responseBuffer);
             if (update?.requestId === requestId) {
                 if (update.action === "set") {
-                    this.logRendezvousTiming("get", type, fieldName, started);
+                    this.pendingReads.delete(requestId);
+                    this.endRendezvous(rdzCtx, "get", type, fieldName);
                     return true;
                 } else if (update.action === "nil") {
-                    this.logRendezvousTiming("get", type, fieldName, started);
+                    this.pendingReads.delete(requestId);
+                    this.endRendezvous(rdzCtx, "get", type, fieldName);
                     return false;
                 }
             }
-            const remaining = deadline - Date.now();
+            if (BrsDevice.pauseIfDebugging()) {
+                // Frozen for a debug session on another thread; debug time must not count toward
+                // the rendezvous timeout, and the request has already been sent (do not re-send).
+                countdown.restart();
+                continue;
+            }
+            const remaining = countdown.remaining();
             if (remaining <= 0) {
                 break;
             }
-            const waitResult = responseBuffer.waitVersion(0, remaining);
-            if (waitResult === "timed-out") {
-                break;
-            }
+            // Cap the sleep so the loop re-checks pauseIfDebugging even if the debugger activates
+            // after we entered the wait; the real timeout is enforced by the `remaining` check above.
+            responseBuffer.waitVersion(0, Math.min(remaining, RENDEZVOUS_POLL_MS));
         }
+        this.pendingReads.delete(requestId);
         throw this.rendezvousTimeoutError("get", type, fieldName);
     }
 
@@ -514,30 +691,35 @@ export class Task extends Node {
             value,
             requestId,
         };
-        const started = sgRoot.logRendezvous ? Date.now() : 0;
+        const rdzCtx = this.beginRendezvous("call", type, methodName);
         this.sendThreadUpdate(request);
-        const deadline = Date.now() + timeoutMs;
+        const countdown = rendezvousDeadline(timeoutMs, () => `call ${type}.${methodName}`);
         const responseBuffer = this.directBuffer ?? this.taskBuffer;
 
         while (true) {
             const update = this.processThreadUpdate(responseBuffer);
             if (update?.requestId === requestId) {
                 if (update.action === "resp") {
-                    this.logRendezvousTiming("call", type, methodName, started);
+                    this.endRendezvous(rdzCtx, "call", type, methodName);
                     return brsValueOf(update.value);
                 } else if (update.action === "nil") {
-                    this.logRendezvousTiming("call", type, methodName, started);
+                    this.endRendezvous(rdzCtx, "call", type, methodName);
                     return undefined;
                 }
             }
-            const remaining = deadline - Date.now();
+            if (BrsDevice.pauseIfDebugging()) {
+                // Frozen for a debug session on another thread; debug time must not count toward
+                // the rendezvous timeout, and the request has already been sent (do not re-send).
+                countdown.restart();
+                continue;
+            }
+            const remaining = countdown.remaining();
             if (remaining <= 0) {
                 break;
             }
-            const waitResult = responseBuffer.waitVersion(0, remaining);
-            if (waitResult === "timed-out") {
-                break;
-            }
+            // Cap the sleep so the loop re-checks pauseIfDebugging even if the debugger activates
+            // after we entered the wait; the real timeout is enforced by the `remaining` check above.
+            responseBuffer.waitVersion(0, Math.min(remaining, RENDEZVOUS_POLL_MS));
         }
         throw this.rendezvousTimeoutError("call", type, methodName);
     }
@@ -550,6 +732,10 @@ export class Task extends Node {
      */
     protected getNewEvents(_: Interpreter, wait: number) {
         if (this.taskBuffer && this.inThread) {
+            // Freeze the task's idle wait while another thread owns the debug session.
+            if (BrsDevice.pauseIfDebugging()) {
+                return new Array<BrsEvent>();
+            }
             const timeout = wait === 0 ? undefined : wait;
             this.taskBuffer.waitVersion(0, timeout);
             this.processThreadUpdate();
@@ -580,11 +766,65 @@ export class Task extends Node {
                 fanout: this.fanoutBuffer?.getBuffer(),
                 tmp: BrsDevice.getTmpVolume(),
                 cacheFS: BrsDevice.getCacheFS(),
-                m: fromAssociativeArray(this.m, true, this),
+                m: serializeTaskM(this.m, this),
                 render: sgRoot.getRenderThreadInfo()?.id,
             };
+            // Events already queued on the task's ports (e.g. an observed field set right before
+            // `control = "RUN"`) must cross with `m`: on a device the copied `m` references the
+            // same native port, so the task function's wait() drains them after launch.
+            const portEvents = collectPortNodeEvents(this.m, this);
+            if (portEvents) {
+                taskData.portEvents = portEvents;
+                this.dropFanoutCoveredByReplay(portEvents);
+            }
             postMessage(taskData);
             this.started = true;
+        }
+    }
+
+    /**
+     * Discards the queued fan-out updates that the launch payload's replayed port events already
+     * cover, so a single write is not delivered twice.
+     *
+     * Activation and launch are not the same moment: `control = "run"` runs `activateTask`
+     * synchronously, which turns render→task fan-out on, while this method (which posts the payload)
+     * only runs on the next `processTasks` pass. A write landing in between is captured by *both*
+     * paths — as a queued fan-out update and as an event on the render-side copy of the port that
+     * `collectPortNodeEvents` sweeps into the payload — and the task saw it twice.
+     *
+     * Matching is on the (node, field) pair, not on the value: a field written twice with the same
+     * value under `alwaysNotify` notifies twice but only syncs once, so comparing values would keep
+     * the wrong number of copies. Events the replay cannot re-target (a node that is neither the task
+     * node nor the global node, which `replayPortNodeEvents` drops with a warning) are deliberately
+     * left alone — for those the fan-out is the only path that can deliver.
+     * @param portEvents Pre-launch port events being shipped with the payload.
+     */
+    private dropFanoutCoveredByReplay(portEvents: Record<string, SerializedPortEvent[]>) {
+        if (this.fanoutQueue.length === 0) {
+            return;
+        }
+        const globalAddress = sgRoot.mGlobal.getAddress();
+        const replayed = new Set<string>();
+        for (const events of Object.values(portEvents)) {
+            for (const event of events) {
+                if (event.node === this.address || event.node === globalAddress) {
+                    replayed.add(`${event.node}|${event.field.toLowerCase()}`);
+                }
+            }
+        }
+        if (replayed.size === 0) {
+            return;
+        }
+        for (let i = this.fanoutQueue.length - 1; i >= 0; i--) {
+            const update = this.fanoutQueue[i];
+            if (replayed.has(`${update.address}|${update.key.toLowerCase()}`)) {
+                this.fanoutQueue.splice(i, 1);
+                if (sgRoot.logRendezvous) {
+                    BrsDevice.stdout.write(
+                        `debug,[rendezvous] thread ${sgRoot.threadId} dropped fan-out ${update.type}.${update.key} -> task thread ${this.threadId} (replayed at launch)`
+                    );
+                }
+            }
         }
     }
 
@@ -610,26 +850,74 @@ export class Task extends Node {
         }
         postMessage(update);
         if (this.inThread && update.action === "set" && update.requestId !== undefined) {
-            const started = sgRoot.logRendezvous ? Date.now() : 0;
+            const rdzCtx = this.beginRendezvous("set", update.type, update.key);
             this.waitForFieldAck(update);
-            this.logRendezvousTiming("set", update.type, update.key, started);
+            this.endRendezvous(rdzCtx, "set", update.type, update.key);
         }
     }
 
     /**
-     * Logs the duration of a completed rendezvous when `sgRoot.logRendezvous` is enabled, mirroring
-     * the Roku SceneGraph debug console `logrendezvous` command to help identify performance issues.
+     * Marks the start of a rendezvous wait: prints the console `[sg.node.BLOCK]` line (when
+     * `sgRoot.logRendezvous` is on) and captures the id/call-site needed to later report the
+     * completed rendezvous to ECP `query/sgrendezvous` (when `sgRoot.rendezvousTracking` is on). A
+     * no-op (returns `undefined`) when neither consumer is active, so a plain run pays no cost.
+     *
+     * The BrightScript call site (`file(line)`) comes from this thread's own interpreter location:
+     * `requestFieldValue`/`requestMethodCall`/`sendThreadUpdate` run synchronously on the thread whose
+     * statement triggered the rendezvous, so `sgRoot.interpreter` here is that statement's interpreter.
+     * The id and location are computed once and shared by both consumers.
      * @param action Rendezvous action performed (`get`, `set`, or `call`).
      * @param type Sync type domain of the target (`global`, `task`, `scene`, or `node`).
      * @param key Field or method name involved in the rendezvous.
-     * @param startedMs Timestamp (ms) captured before the rendezvous started.
+     * @returns Context to pass to {@link endRendezvous}, or `undefined` if tracing/tracking are off.
      */
-    private logRendezvousTiming(action: string, type: SyncType, key: string, startedMs: number) {
+    private beginRendezvous(action: string, type: SyncType, key: string): RendezvousCtx | undefined {
+        const tracking = sgRoot.rendezvousTracking && BrsDevice.tracking;
+        if (!sgRoot.logRendezvous && !tracking) {
+            return undefined;
+        }
+        const id = nextRendezvousId();
+        const loc = sgRoot.interpreter?.location;
+        let file = "pkg:/unknown";
+        if (loc) {
+            file = loc.file.startsWith("pkg:") ? loc.file : `pkg:/${loc.file}`;
+        }
+        const line = loc?.start.line ?? 0;
         if (sgRoot.logRendezvous) {
-            const ms = Date.now() - startedMs;
+            const location = line ? `${file}(${line})` : `${file}(??)`;
+            const detail = BrsDevice.deviceInfo.logLevel === LogLevel.Debug ? ` ${action} ${type}.${key}` : "";
+            BrsDevice.stdout.write(`print,${getNow()} [sg.node.BLOCK] Rendezvous[${id}]${detail} at ${location}\r\n`);
+        }
+        return { id, file, line, startedMs: Math.round(sgClock.perfNow()) };
+    }
+
+    /**
+     * Marks the end of a rendezvous wait: prints the console `[sg.node.UNBLOCK]` line (when
+     * `sgRoot.logRendezvous` is on) and, when `sgRoot.rendezvousTracking` is on, posts the completed
+     * `RendezvousEvent` for the host to queue for ECP `query/sgrendezvous`. A no-op when `ctx` is
+     * `undefined`, meaning both were off when the matching {@link beginRendezvous} ran.
+     * @param ctx The context returned by {@link beginRendezvous}, or `undefined`.
+     * @param action Rendezvous action performed (`get`, `set`, or `call`).
+     * @param type Sync type domain of the target (`global`, `task`, `scene`, or `node`).
+     * @param key Field or method name involved in the rendezvous.
+     */
+    private endRendezvous(ctx: RendezvousCtx | undefined, action: string, type: SyncType, key: string) {
+        if (!ctx) {
+            return;
+        }
+        const endedMs = Math.round(sgClock.perfNow());
+        if (sgRoot.logRendezvous) {
+            const elapsedMs = endedMs - ctx.startedMs;
+            const detail = BrsDevice.deviceInfo.logLevel === LogLevel.Debug ? ` ${action} ${type}.${key}` : "";
+            const duration = elapsedMs > 0 ? ` in ${(elapsedMs / 1000).toFixed(3)} s` : "";
             BrsDevice.stdout.write(
-                `debug,[rendezvous] thread ${sgRoot.threadId} ${action} ${type}.${key} on thread ${this.threadId} took ${ms}ms`
+                `print,${getNow()} [sg.node.UNBLOCK] Rendezvous[${ctx.id}]${detail} completed${duration}\r\n`
             );
+        }
+        if (sgRoot.rendezvousTracking && BrsDevice.tracking) {
+            postMessage({
+                rendezvous: { id: ctx.id, startTm: ctx.startedMs, endTm: endedMs, line: ctx.line, file: ctx.file },
+            });
         }
     }
 
@@ -672,7 +960,9 @@ export class Task extends Node {
                 BrsDevice.stdout.write(
                     `debug,[task:${sgRoot.threadId}] Node sync type: ${update.type}, from ${update.id} ${
                         update.action
-                    } '${update.key}' - target node not found! It was ${replied ? "replied" : "not replied"}`
+                    } '${update.key}' address ${update.address ?? "n/a"} - target node not found! It was ${
+                        replied ? "replied" : "not replied"
+                    }`
                 );
                 return undefined;
             }
@@ -703,6 +993,14 @@ export class Task extends Node {
         } else if (update.type === "scene") {
             return sgRoot.scene;
         } else if (update.type === "task") {
+            // A `task`-domain update normally targets the sending task's own node, whose address
+            // matches ours. A worker-pool dispatch (one task writing *another* Task node's field)
+            // carries the target's address instead, so honor it rather than assuming `this` —
+            // otherwise the write lands on the sender's node. Unresolvable falls through to
+            // `handleUnresolvedNode`, which still acks so the sender does not hang.
+            if (update.address && update.address !== this.address) {
+                return this.resolveNode(update.address, true);
+            }
             return this;
         } else if (update.address) {
             return this.resolveNode(update.address, true);
@@ -720,26 +1018,72 @@ export class Task extends Node {
     private handleSetFieldRequest(node: Node, update: ThreadUpdate) {
         const oldValue = node.getValue(update.key);
         let value: BrsType;
-        if (!this.inThread && oldValue instanceof Node && oldValue.getAddress() === update.value._address_) {
-            // Update existing node to preserve references
-            value = updateSGNode(update.value, oldValue);
-        } else {
-            value = brsValueOf(update.value);
+        // `update.value` is null when the other thread set the field to `invalid` (jsValueOf maps it
+        // to null), which is a legitimate way to clear a node-valued field — reading `_address_` off
+        // it threw and killed the whole task-update pass.
+        // As in `handleMethodCallRequest`: a node arriving as a field value carries its port
+        // observations, which belong to the sending thread.
+        const priorThread = sgRoot.deserializingThread;
+        sgRoot.deserializingThread = this.inThread ? -1 : update.id;
+        try {
+            if (!this.inThread && oldValue instanceof Node && oldValue.getAddress() === update.value?._address_) {
+                // Update existing node to preserve references
+                value = updateSGNode(update.value, oldValue);
+            } else {
+                value = brsValueOf(update.value);
+            }
+        } finally {
+            sgRoot.deserializingThread = priorThread;
         }
         node.markFieldFresh(update.key);
-        node.setValue(update.key, value, false, undefined, false);
+        // An update that lands on a node nobody is watching (a stale duplicate holding the same
+        // address) or whose value already equals what the field held (which suppresses notification)
+        // looks identical to a successful delivery unless the receiving side's state is reported.
+        const observed = sgRoot.logRendezvous
+            ? node.resolveField(update.key.toLowerCase())?.isObserved() ?? false
+            : false;
+        const previous = sgRoot.logRendezvous ? describeSimpleValue(oldValue) : "";
+        // A reply to one of *our* reads only mirrors the owner's value locally — it is not a change,
+        // so it must not fire this thread's observers (see `pendingReads`).
+        const isReadReply = update.requestId !== undefined && this.pendingReads.has(update.requestId);
+        if (isReadReply) {
+            node.setValueSilent(update.key, value);
+        } else {
+            node.setValue(update.key, value, false, undefined, false);
+        }
         if (sgRoot.logRendezvous) {
             BrsDevice.stdout.write(
-                `debug,[rendezvous] thread ${sgRoot.threadId} applied set ${update.type}.${update.key} from thread ${update.id}`
+                `debug,[rendezvous] thread ${sgRoot.threadId} applied set ${update.type}.${update.key} from thread ${
+                    update.id
+                } on ${
+                    node.nodeSubtype
+                }#${node.getAddress()} (observed=${observed} silent=${isReadReply} ${previous}->${describeSimpleValue(
+                    value
+                )})`
             );
         }
         // The render fans a task's applied set out to the other observing tasks itself (targeted to
-        // observers, excluding the originator) rather than relying on the broker to blind-relay. Only
-        // shared domains (global/scene/node) cross between tasks — `task`-type fields are private to a
-        // single task, mirroring the broker's `type !== "task"` guard; fanning them out would deliver
-        // one task's field into another task's identically-named field (and corrupt node ownership).
-        if (this.fanoutBuffer && !this.inThread && update.type !== "task") {
-            node.fanOutFieldToObservingTasks(update.key, update.id);
+        // observers, excluding the originator) rather than relying on the broker to blind-relay.
+        if (this.fanoutBuffer && !this.inThread) {
+            if (update.type === "task") {
+                // A `task`-domain field belongs to one specific Task node. Fanning it out *by type
+                // alone* used to be unsafe — it would land one task's field in another task's
+                // identically-named field — which is why this was skipped wholesale. Updates now
+                // carry the target's address and `getNodeToUpdate` resolves it, so both deliveries
+                // below are unambiguous.
+                //
+                // 1. The node's own thread, when the write came from somewhere else (a worker-pool
+                //    dispatch: one task writing another task's field).
+                const target = node !== this && node instanceof Task ? node : undefined;
+                target?.syncRemoteField(update.key, value);
+                // 2. Any *other* task port-observing the field — e.g. a coordinator watching its
+                //    pool slots' `response`. `observeField(field, port)` from a task rendezvouses
+                //    here and registers on the render copy, so `isPortObserved` sees it; without
+                //    this the observing task's own port never fires and it waits forever.
+                node.fanOutFieldToObservingTasks(update.key, update.id, target?.threadId ?? -1);
+            } else {
+                node.fanOutFieldToObservingTasks(update.key, update.id);
+            }
         }
         // Send acknowledgement back to the other thread if needed
         if (!this.inThread && update.requestId !== undefined) {
@@ -748,6 +1092,45 @@ export class Task extends Node {
             this.sendThreadUpdate(update);
         }
         return update;
+    }
+
+    /**
+     * Records (or clears) a task thread's port observation when its `observeField`/`unobserveField`
+     * call arrives here by rendezvous.
+     *
+     * The `roMessagePort` argument does not survive serialization — it is rebuilt as a fresh, empty
+     * port — so the observer this call is about to register on the render copy can never fire.
+     * Remembering *which thread* asked lets `fanOutFieldToObservingTasks` push the value back to
+     * that thread, where the real port lives.
+     * @param target Node the method was called on.
+     * @param update Thread update carrying the originating thread id in `id`.
+     * @param args Serialized argument list from the method-call payload.
+     */
+    private trackRemotePortObserver(target: Node, update: ThreadUpdate, args: any) {
+        const method = update.key.toLowerCase();
+        const observing = method === "observefield" || method === "observefieldscoped";
+        const unobserving = method === "unobservefield" || method === "unobservefieldscoped";
+        if (!observing && !unobserving) {
+            return;
+        }
+        const fieldName = Array.isArray(args) ? args[0] : undefined;
+        if (typeof fieldName !== "string") {
+            return;
+        }
+        const field = target.resolveField(fieldName.toLowerCase());
+        if (!field) {
+            return;
+        }
+        // `observeField` is overloaded on its second argument; only the port form needs tracking,
+        // and a serialized port is the `{_component_: "roMessagePort"}` stub.
+        if (observing && args[1]?._component_?.toLowerCase() !== "romessageport") {
+            return;
+        }
+        if (observing) {
+            field.addRemotePortObserver(update.id);
+        } else {
+            field.removeRemotePortObserver(update.id);
+        }
     }
 
     /**
@@ -768,9 +1151,21 @@ export class Task extends Node {
         if (!method || !sgRoot.interpreter) {
             return;
         }
-        const value = brsValueOf(payload.args);
+        // Attribute any `_observed_` carried by node arguments to the calling thread while they are
+        // rebuilt (see `applyRemotePortObservers`); restore so nested rebuilds stay correct.
+        const priorThread = sgRoot.deserializingThread;
+        sgRoot.deserializingThread = this.inThread ? -1 : update.id;
+        let value: BrsType;
+        try {
+            value = brsValueOf(payload.args);
+        } finally {
+            sgRoot.deserializingThread = priorThread;
+        }
         const args: BrsType[] = value instanceof RoArray ? value.getElements() : [];
         const location = payload.location ?? sgRoot.interpreter.location;
+        if (!this.inThread) {
+            this.trackRemotePortObserver(target, update, payload.args);
+        }
         const result = sgRoot.interpreter.call(method, args, hostNode.m, location, hostNode);
         update.action = "resp";
         if (result instanceof Node) {
@@ -811,12 +1206,26 @@ export class Task extends Node {
      */
     private resolveNode(address: string, searchFields: boolean = false): Node | undefined {
         if (address) {
+            // Live reachability wins. The cross-thread registry can hold a *stale duplicate* instance
+            // for an address: `toSGNode` copies `_address_` when it rebuilds a node on the receiving
+            // thread, so repeated serializations of the same logical node mint new instances that share
+            // its address, and `registerCrossThreadNode` keeps only the latest. Resolving the registry
+            // first therefore risks targeting a detached duplicate instead of the node actually wired
+            // into the scene (field writes/observers landing on the wrong copy). Walk the trees first so
+            // a node still reachable from task/scene/global always resolves to its authoritative copy.
             const rootNodes = [this, sgRoot.scene, sgRoot.mGlobal];
             for (const rootNode of rootNodes) {
                 const foundNode = this.findNodeByAddress(rootNode, address, searchFields);
                 if (foundNode) {
                     return foundNode;
                 }
+            }
+            // Fallback: a node held only by the other thread (a true orphan — e.g. a per-request
+            // callback node a task keeps a reference to) is unreachable from the trees above; resolve it
+            // by address so late write-backs still reach it, mirroring Roku's process-wide references.
+            const crossThreadNode = sgRoot.getCrossThreadNode(address);
+            if (crossThreadNode) {
+                return crossThreadNode;
             }
         }
         return undefined;

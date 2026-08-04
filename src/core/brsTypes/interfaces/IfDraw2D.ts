@@ -33,6 +33,8 @@ export type MeasuredText = { text: string; width: number; height: number; ellips
  */
 export class IfDraw2D {
     private readonly component: BrsDraw2D;
+    /** Depth of the active pushClip()/popClip() stack, so an unbalanced frame can be unwound. */
+    private clipDepth: number = 0;
 
     constructor(component: BrsDraw2D) {
         this.component = component;
@@ -154,6 +156,10 @@ export class IfDraw2D {
     }
 
     doDrawText(text: string, x: number, y: number, rgba: number, opacity: number, font: RoFont) {
+        if (text === "") {
+            // node-canvas crashes on empty-string text APIs; nothing to draw anyway
+            return;
+        }
         const baseX = this.component.x;
         const baseY = this.component.y;
         const ctx = this.component.getContext();
@@ -176,6 +182,10 @@ export class IfDraw2D {
         font: RoFont,
         rotation: number
     ) {
+        if (text === "") {
+            // node-canvas crashes on empty-string text APIs; nothing to draw anyway
+            return;
+        }
         const baseX = this.component.x;
         const baseY = this.component.y;
         const ctx = this.component.getContext();
@@ -205,6 +215,7 @@ export class IfDraw2D {
         ctx.beginPath();
         ctx.rect(rect.x, rect.y, rect.width, rect.height);
         ctx.clip();
+        this.clipDepth++;
     }
 
     /**
@@ -212,8 +223,33 @@ export class IfDraw2D {
      * effectively removing the last applied clipping region.
      */
     popClip() {
+        if (this.clipDepth === 0) {
+            return;
+        }
         const ctx = this.component.getContext();
         ctx.restore();
+        this.clipDepth--;
+    }
+
+    /**
+     * Unwinds any clipping regions still active, restoring the context to its unclipped state.
+     *
+     * `pushClip` is `ctx.save()` and `popClip` is `ctx.restore()`, so an unbalanced pair is not a
+     * transient glitch: the canvas keeps the stale clip for the rest of its life, and every later
+     * frame draws inside it. Render code brackets its own clips with try/finally, but an error
+     * escaping from arbitrary BrightScript (an item component's `init()`, a field observer) can
+     * still unwind past a bracket that has not been reached yet. Called from a `finally` around the
+     * per-frame paint so one bad frame cannot poison the next.
+     */
+    resetClips() {
+        while (this.clipDepth > 0) {
+            this.popClip();
+        }
+    }
+
+    /** Depth of the active clip stack. Exposed for the frame-level balance check and tests. */
+    getClipDepth(): number {
+        return this.clipDepth;
     }
 
     drawNinePatch(bitmap: RoBitmap, rect: Rect, rgba?: number, opacity?: number) {

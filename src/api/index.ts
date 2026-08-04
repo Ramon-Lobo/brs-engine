@@ -32,6 +32,7 @@ import {
     isExtensionInfo,
     GraphicsData,
     isGraphicsData,
+    RendezvousEvent,
     LogLevel,
 } from "../core/common";
 import {
@@ -61,6 +62,7 @@ import {
     setDisplayState,
     setCaptionMode,
     setAppCaptionStyle,
+    setCaptionRenderArea,
     setTrickPlayBar,
     setSupportCaptions,
 } from "./display";
@@ -119,6 +121,8 @@ export {
     setCaptionStyle,
     enableStats,
     getScreenshot,
+    setFrameNotify,
+    getDisplayBuffer,
 } from "./display";
 
 // Common API
@@ -151,6 +155,10 @@ const registryBuffer = new SharedObject(RegistryInitialSize, RegistryMaxSize);
 let sharedBuffer: ArrayBufferLike;
 let sharedArray: Int32Array;
 let currentPayload: AppPayload;
+
+// Display events relayed to the host untouched. Hoisted because `framePainted` arrives on every
+// repaint (up to 60 times per second), so the lookup must not allocate.
+const forwardedDisplayEvents = new Set(["redraw", "resolution", "framePainted", "frameCleared"]);
 
 /**
  * Initializes the BrightScript engine with device configuration and options.
@@ -217,7 +225,7 @@ export async function initialize(customDeviceInfo?: Partial<DeviceInfo>, options
                 terminate(AppExitReason.Settings);
             }
             notifyAll("display", data);
-        } else if (["redraw", "resolution"].includes(event)) {
+        } else if (forwardedDisplayEvents.has(event)) {
             notifyAll(event, data);
         } else if (["error", "warning"].includes(event)) {
             apiException(event, data);
@@ -293,6 +301,8 @@ export async function initialize(customDeviceInfo?: Partial<DeviceInfo>, options
             handleRegistryUpdate(data);
         } else if (event === "captionMode") {
             notifyAll(event, data);
+        } else if (event === "rendezvous") {
+            recordRendezvousEvent(data as RendezvousEvent);
         } else if (event === "debug") {
             deviceDebug(`debug,${data}\r\n`);
         }
@@ -328,8 +338,16 @@ export function unsubscribe(observerId: string) {
  * @param eventData Optional data associated with the event
  */
 function notifyAll(eventName: string, eventData?: any) {
-    for (const [_id, callback] of observers) {
-        callback(eventName, eventData);
+    for (const [id, callback] of observers) {
+        try {
+            callback(eventName, eventData);
+        } catch (err: any) {
+            // Host callbacks are relayed from inside the display's requestAnimationFrame loop (see
+            // `framePainted`), which reschedules itself after notifying: an observer that throws would
+            // unwind past that and permanently stop rendering. Reported to the console rather than
+            // through `apiException`, which would recurse into the same faulty observer.
+            console.error(`[api] observer "${id}" failed on "${eventName}" event:`, err);
+        }
     }
 }
 
@@ -361,6 +379,9 @@ export function execute(filePath: string, fileData: any, options: any = {}, deep
         deviceData.debugOnCrash = false;
     } else if (typeof options.debugOnCrash === "boolean") {
         deviceData.debugOnCrash = options.debugOnCrash;
+    }
+    if (typeof options.logRendezvous === "boolean") {
+        setRendezvousLog(options.logRendezvous);
     }
     if (brsWorker !== undefined) {
         resetWorker();
@@ -456,6 +477,97 @@ export function setAudioMute(mute: boolean) {
         muteSound(mute);
         muteVideo(mute);
     }
+}
+
+/**
+ * Gets whether SceneGraph cross-thread rendezvous tracing is enabled.
+ * @returns True if rendezvous tracing is on
+ */
+export function getRendezvousLog(): boolean {
+    return Atomics.load(sharedArray, DataType.RDZ) === 1;
+}
+
+/**
+ * Enables or disables SceneGraph cross-thread rendezvous tracing — the equivalent of Roku's
+ * `logrendezvous` and of the CLI's `-z` flag. Each crossing then reports a pair of `debug` events to
+ * subscribers, mirroring Roku's own console lines: a `[sg.node.BLOCK] Rendezvous[N] at <file>(<line>)`
+ * when the wait begins, and a `[sg.node.UNBLOCK] Rendezvous[N] completed in X.XXX s` when it ends
+ * (the duration clause is omitted when it rounds to zero). `N` is a monotonic id shared by every
+ * thread. When `deviceInfo.logLevel` is `LogLevel.Debug`, both lines also carry the action and
+ * target (`get`/`set`/`call` and the `type.key` accessed) — detail Roku's own console does not show.
+ *
+ * Takes effect immediately, including on Task threads already running: the flag lives in the shared
+ * control array, which every thread reads. It is also recorded on the device info so a Task started
+ * later inherits the current setting, and it persists across `execute()` calls until changed.
+ *
+ * Tracing is verbose on task-heavy apps — expect a BLOCK/UNBLOCK pair per field read, write and
+ * method call that crosses a thread.
+ * @param enable True to trace rendezvous, false to stop
+ */
+export function setRendezvousLog(enable: boolean) {
+    deviceData.logRendezvous = enable;
+    Atomics.store(sharedArray, DataType.RDZ, enable ? 1 : 0);
+}
+
+// Rendezvous events queued for ECP `query/sgrendezvous`, capped the same as a real device (1,000
+// events between calls); events beyond the cap are counted in `rendezvousDropCount` instead of kept.
+const MAX_RENDEZVOUS_QUEUE = 1000;
+const rendezvousQueue: RendezvousEvent[] = [];
+let rendezvousDropCount = 0;
+
+/**
+ * Queues a rendezvous event reported by a Task thread, applying the same 1,000-event cap and
+ * drop-count Roku's `query/sgrendezvous` uses, then republishes it as a `rendezvous` event so a host
+ * (e.g. a desktop app's own ECP server) can also observe it live instead of polling
+ * {@link requestRendezvousEvents}.
+ * @param event The rendezvous event reported by the Task thread
+ */
+function recordRendezvousEvent(event: RendezvousEvent) {
+    if (rendezvousQueue.length < MAX_RENDEZVOUS_QUEUE) {
+        rendezvousQueue.push(event);
+    } else {
+        rendezvousDropCount++;
+    }
+    notifyAll("rendezvous", event);
+}
+
+/**
+ * Gets whether ECP-style SceneGraph rendezvous tracking is enabled — the equivalent of Roku's
+ * `sgrendezvous/track` state. Independent of {@link getRendezvousLog}.
+ * @returns True if rendezvous events are being tracked
+ */
+export function getRendezvousTracking(): boolean {
+    return Atomics.load(sharedArray, DataType.RDT) === 1;
+}
+
+/**
+ * Enables or disables ECP-style SceneGraph rendezvous tracking — the equivalent of Roku's
+ * `sgrendezvous/track` and `sgrendezvous/untrack` ECP commands. Unlike {@link setRendezvousLog} (which
+ * prints console lines), enabling this collects structured `RendezvousEvent` records for
+ * {@link requestRendezvousEvents} and the `rendezvous` event, so a host application can implement its
+ * own ECP `sgrendezvous` route by calling into this API. Enabling clears any previously queued events,
+ * matching Roku's "tracking a different app clears any queued rendezvous events" behavior.
+ * @param enable True to start tracking, false to stop
+ */
+export function setRendezvousTracking(enable: boolean) {
+    if (enable) {
+        rendezvousQueue.length = 0;
+        rendezvousDropCount = 0;
+    }
+    Atomics.store(sharedArray, DataType.RDT, enable ? 1 : 0);
+}
+
+/**
+ * Returns the rendezvous events queued since tracking was enabled or the previous call to this
+ * function, then drains the queue and drop count for the next window — mirroring the "since tracking
+ * was enabled, or since the previous call" semantics of Roku's `query/sgrendezvous`.
+ * @returns The queued events and the count of events dropped because the queue exceeded its cap
+ */
+export function requestRendezvousEvents(): { events: RendezvousEvent[]; dropCount: number } {
+    const events = rendezvousQueue.splice(0);
+    const dropCount = rendezvousDropCount;
+    rendezvousDropCount = 0;
+    return { events, dropCount };
 }
 
 /**
@@ -566,6 +678,9 @@ function resetArray() {
         Atomics.store(sharedArray, index, -1);
         return index === DataBufferIndex - 1;
     });
+    // Rendezvous tracing is a host setting, not app state: restore it from the device info so it
+    // survives the worker reset that starts each app, rather than silently turning itself off.
+    Atomics.store(sharedArray, DataType.RDZ, deviceData.logRendezvous ? 1 : 0);
 }
 
 /**
@@ -747,6 +862,8 @@ function mainCallback(event: MessageEvent) {
         setSupportCaptions(event.data.supportCaptions);
     } else if (Array.isArray(event.data.captionStyle)) {
         setAppCaptionStyle(event.data.captionStyle);
+    } else if (typeof event.data.captionRenderArea === "object" && event.data.captionRenderArea !== null) {
+        setCaptionRenderArea(event.data.captionRenderArea);
     } else if (typeof event.data.trickPlayBarVisible === "boolean") {
         setTrickPlayBar(event.data.trickPlayBarVisible);
     } else if (isAppData(event.data)) {
