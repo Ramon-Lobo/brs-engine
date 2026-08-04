@@ -7,8 +7,10 @@ import {
     BrsType,
     Float,
     Int32,
+    isAnyNumber,
     isBrsString,
     RoArray,
+    RoAssociativeArray,
     RoBitmap,
     RoFont,
     ValueKind,
@@ -25,7 +27,7 @@ import type { ScrollingLabel } from "./ScrollingLabel";
 import { Node } from "./Node";
 import { FieldKind, FieldModel, isFont } from "../SGTypes";
 import { SGNodeType } from ".";
-import { convertHexColor, rectContainsRect, rotateRect, unionRect } from "../SGUtil";
+import { convertHexColor, rectContainsRect, rotateRect, rotateTranslation, unionRect } from "../SGUtil";
 import { SGNodeFactory } from "../factory/NodeFactory";
 import { jsValueOf } from "../factory/Serializer";
 
@@ -50,7 +52,34 @@ export class Group extends Node {
     protected resolution: string;
     private cachedLines: MeasuredText[] = [];
     private cachedHeight: number = 0;
-    isDirty: boolean;
+    private _isDirty: boolean = true;
+    /**
+     * The (origin, angle, opacity) context of this node's last completed layout pass. A pruned
+     * refresh may skip the subtree only when the incoming context matches EXACTLY (float
+     * equality): a moved/rotated/faded ancestor changes the context of every descendant, which
+     * re-renders them even though their own fields never changed.
+     */
+    private lastLayoutContext?: { x: number; y: number; angle: number; opacity: number };
+    /** @internal Number of non-skipped render passes this node has run; exposed for pruning tests. */
+    layoutPassCount = 0;
+
+    get isDirty(): boolean {
+        return this._isDirty;
+    }
+
+    /**
+     * Dirtying a node also marks its subtree stale for the pruned layout refresh: ~65 sites set
+     * `isDirty = true` directly (bypassing `makeDirty`), and each represents render-relevant state
+     * the next layout pass must see. Routing the stale mark through this setter keeps the pruning
+     * invariant without auditing every site. Clearing (`false`) leaves the stale mark alone —
+     * `subtreeStale` is cleared only at the start of the node's own layout pass.
+     */
+    set isDirty(value: boolean) {
+        this._isDirty = value;
+        if (value) {
+            this.markSubtreeStale();
+        }
+    }
 
     constructor(initializedFields: AAMember[] = [], readonly name: string = SGNodeType.Group) {
         super([], name);
@@ -370,10 +399,12 @@ export class Group extends Node {
             this.refreshLines(text, drawFont, rect, ellipsis, numLines, maxLines, lineSpacing, displayPartialLines);
         }
         let y = rect.y;
-        if (vertAlign === "center") {
-            y += (rect.height - this.cachedHeight) / 2;
-        } else if (vertAlign === "bottom") {
-            y += rect.height - this.cachedHeight;
+        if (rect.height > this.cachedHeight) {
+            if (vertAlign === "center") {
+                y += (rect.height - this.cachedHeight) / 2;
+            } else if (vertAlign === "bottom") {
+                y += rect.height - this.cachedHeight;
+            }
         }
         let ellipsized = false;
         for (const line of this.cachedLines) {
@@ -409,7 +440,9 @@ export class Group extends Node {
         const lines = this.breakTextIntoLines(text, drawFont, rect.width);
         const lineHeight = drawFont.measureTextHeight();
         let renderedLines = lines;
-        let totalHeight = lines.length * lineHeight;
+        // Match the draw loop in drawTextWrap, which advances by lineHeight + lineSpacing
+        // between lines: the visible extent of N lines is N*lineHeight + (N-1)*lineSpacing.
+        let totalHeight = lines.length * lineHeight + (lines.length > 1 ? (lines.length - 1) * lineSpacing : 0);
 
         if (rect.height > 0) {
             const maxRenderedLines = Math.floor((rect.height + lineSpacing) / (lineHeight + lineSpacing));
@@ -564,14 +597,46 @@ export class Group extends Node {
         return rect;
     }
 
+    /**
+     * Records a measured size in all three coordinate-space rects, not just rectLocal.
+     * Used by label getMeasured() implementations: a component sizing itself from a detached
+     * label's boundingRect() (parent space) can query before any render pass reaches the label,
+     * and mid-render getBoundingRect's measuring fallback is skipped when rectLocal is already
+     * non-zero — so the measure must land in every space rather than leave a stale zero
+     * rectToParent/rectToScene. Width/height are translation-invariant; the true origins are
+     * recomputed when a render pass reaches the node in renderNode.
+     */
+    protected setMeasuredBoundingRects(width: number, height: number) {
+        const trans = this.getTranslation();
+        this.rectLocal = { x: 0, y: 0, width, height };
+        this.rectToParent = { x: trans[0], y: trans[1], width, height };
+        this.rectToScene = { x: trans[0], y: trans[1], width, height };
+    }
+
     protected updateBoundingRects(drawRect: Rect, origin: number[], rotation: number) {
         const nodeTrans = this.getTranslation();
         this.rectLocal = { x: 0, y: 0, width: drawRect.width, height: drawRect.height };
         if (rotation === 0) {
+            // Local space must agree with the parent/scene rects below: a grid's drawRect is outset
+            // by its focus margins, and local is parent-space minus the node's own translation. Left
+            // at {0,0} this reported a local sub-rect offset by the margin on both axes
+            // (Node.getSubBoundingRect bases the "local" variant on rectLocal).
+            this.rectLocal = {
+                x: drawRect.x - origin[0] - nodeTrans[0],
+                y: drawRect.y - origin[1] - nodeTrans[1],
+                width: drawRect.width,
+                height: drawRect.height,
+            };
             this.rectToScene = drawRect;
+            // Parent-relative position comes from the DRAW rect, not from the node's translation.
+            // The two are the same for an ordinary node, but a grid's updateRect outsets drawRect by
+            // its focus margins — and a device reports that outset. Reading nodeTrans here dropped it,
+            // so a grid's reported rect had the widened width/height but the un-offset x/y.
+            // DEVICE-MEASURED: a PosterGrid at translation [0,320] reports y=306 (a 14px outset), and
+            // a LabelList at [0,0] reports x=-24.
             this.rectToParent = {
-                x: nodeTrans[0],
-                y: nodeTrans[1],
+                x: drawRect.x - origin[0],
+                y: drawRect.y - origin[1],
                 width: drawRect.width,
                 height: drawRect.height,
             };
@@ -635,15 +700,106 @@ export class Group extends Node {
         return false;
     }
 
+    /**
+     * Render entry point for every node. This is a TEMPLATE METHOD and should not be overridden —
+     * node types implement `renderNodeContent` instead, and this wrapper applies the node's own
+     * `clippingRect` around it.
+     *
+     * The clip lives here rather than inside each node's body because `clippingRect` is declared on
+     * `Group` and inherited by every renderable node, and per the SceneGraph reference it limits
+     * "all drawing by this node AND its children" — so it has to bracket the node's own geometry,
+     * not just the child traversal. Doing it in the parent's `renderChildren` instead would miss the
+     * eight call sites that render a child directly (PanelSet's ordered panels, the grid/list item
+     * renderers, TargetGroup) and both `RoSGScreen` entry points (Scene and Dialog are painted via
+     * `paintNode`, with no parent traversal above them).
+     *
+     * Measurement/layout passes stay unclipped: `pushClippingRect` no-ops without a `draw2D`.
+     */
     renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
-        if (!this.isVisible()) {
-            this.updateRenderTracking(true);
-            return;
+        this.prepareRender(draw2D);
+        // Order matters for cost, not just correctness. A layout/measure pass never clips (bounding
+        // rects must stay unclipped), and an invisible node draws nothing — check both before probing
+        // the field, so the overwhelmingly common case is one comparison. The real visibility gates
+        // stay inside each renderNodeContent: they differ per node type (soft skip for containers,
+        // hard skip for renderables, hidden-extent measurement for grids).
+        const clipped = draw2D !== undefined && this.isVisible() && this.pushClippingRect(origin, angle, draw2D);
+        try {
+            this.renderNodeContent(interpreter, origin, angle, opacity, draw2D);
+        } finally {
+            if (clipped) {
+                draw2D?.popClip();
+            }
         }
+    }
+
+    /**
+     * Runs before the node's draw translation is computed, for node types that must settle their own
+     * position first. Default is a no-op; `StandardDialog` overrides it because its layout assigns
+     * its OWN translation, which the clip position then has to be derived from.
+     */
+    protected prepareRender(draw2D?: IfDraw2D) {
+        // override in derived classes
+    }
+
+    /**
+     * This node's draw translation: its own translation composed with the parent-space `origin`,
+     * rotated by any inherited angle.
+     *
+     * Every node must position its own drawing through this method, so the clip `renderNode` pushes
+     * can never drift from where the node actually paints.
+     *
+     * DEVICE-MEASURED (Streaming Stick, Roku OS 15.2; probe `out/layout-measure-probe`, case `R`):
+     * an inherited rotation rotates a child's own translation vector for EVERY node type. Two
+     * identical hosts rotated 90° with a child translated [100, 0] put the child at the same rotated
+     * position whether that child was a `Group` or a `Rectangle`. The engine used to rotate for 18
+     * renderable types but not for `Group` or the keyboard/text-entry containers — a split that
+     * looked accidental (#1133 preserved it pending exactly this measurement) and placed a container's
+     * children 100px off under a rotated ancestor.
+     */
+    protected getDrawTranslation(origin: number[], angle: number): number[] {
         const nodeTrans = this.getTranslation();
-        const drawTrans = nodeTrans.slice();
+        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
         drawTrans[0] += origin[0];
         drawTrans[1] += origin[1];
+        return drawTrans;
+    }
+
+    /**
+     * The node's actual rendering. Override this (never `renderNode`) in a derived node type.
+     */
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
+        if (this.skipRender(draw2D)) {
+            return;
+        }
+        if (this.skipSettledLayout(origin, angle, opacity, draw2D)) {
+            return;
+        }
+        // Clear the stale mark BEFORE the pass, not after: BrightScript that runs inside it (an
+        // item component's init(), a field observer) can write fields — clearing afterwards would
+        // wipe the mark those writes set and strand the change until something unrelated dirties
+        // this subtree again. Record the incoming context a completed pass ran under; a pruned
+        // refresh may only skip when the same context comes back.
+        //
+        // Both happen ONLY inside the pruned full refresh itself: scoped measurements (the
+        // mid-render fallback, measureUnsizedChildren) render at origin [0,0], and a detached
+        // component root's real refresh ALSO runs at [0,0] — if a scoped pass recorded that
+        // context and cleared the mark, the real refresh would skip on the scoped pass's partial
+        // rects (its parent's union was snapshot/restored away, or its layout hadn't been applied
+        // yet). Paint passes don't participate in pruning at all.
+        if (sgRoot.pruneLayout) {
+            this.subtreeStale = false;
+            this.measureStale = false;
+            this.lastLayoutContext = { x: origin[0], y: origin[1], angle, opacity };
+        }
+        this.layoutPassCount++;
+        const nodeTrans = this.getTranslation();
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const rotation = angle + this.getRotation();
         this.rectLocal = {
             x: Number.POSITIVE_INFINITY,
@@ -663,10 +819,62 @@ export class Group extends Node {
             width: 0,
             height: 0,
         };
-        opacity = opacity * this.getOpacity();
+        // An invisible group traversed by a measurement pass propagates opacity 0 so its (visible)
+        // descendants compute their rects but keep reporting renderTracking "none" — they are laid
+        // out, not displayed.
+        opacity = this.isVisible() ? opacity * this.getOpacity() : 0;
+        // The clippingRect bracket lives in the renderNode template, so it wraps this whole body.
         this.renderChildren(interpreter, drawTrans, rotation, opacity, draw2D);
         this.updateContainerBounds(nodeTrans, drawTrans);
         this.nodeRenderingDone(origin, angle, opacity, draw2D);
+    }
+
+    /**
+     * Applies this node's `clippingRect`, limiting where the node and its children may draw. Pushed
+     * by the `renderNode` template so it brackets the node's OWN geometry as well as its children,
+     * per the reference ("all drawing by this node and its children").
+     * The rect is in the node's local coordinate system (per the SceneGraph reference), so it is
+     * translated to scene/screen space by the node's draw translation before being pushed. An
+     * empty rect (width or height ≤ 0, the default `[0,0,0,0]`) disables clipping. Clipping is only
+     * applied on a real draw pass (`draw2D` present); a measurement/layout pass (no draw target)
+     * must remain unclipped so hidden-UI bounding rects still compute. The canvas clip intersects
+     * any already-active clip, so nested/ancestor `clippingRect`s compose and stay bounded by the
+     * screen. Returns whether a clip was pushed (caller must `popClip()` when true).
+     */
+    protected pushClippingRect(origin: number[], angle: number, draw2D?: IfDraw2D): boolean {
+        if (!draw2D) {
+            return false;
+        }
+        // Fast path for the overwhelmingly common "no clip" case. The generic read converts the whole
+        // rect2d associative array to a fresh JS object (allocating a WeakSet and walking its entries)
+        // — cheap once, but this now runs for every node on every paint pass, so an empty rect must
+        // not pay for it. `rect2d` values are always stored with lowercase numeric x/y/width/height
+        // (Field.convertRect2D rebuilds them), and anything that does not match falls through to the
+        // generic path below, so semantics are unchanged.
+        const raw = this.getValue("clippingRect");
+        if (raw instanceof RoAssociativeArray) {
+            const width = raw.elements.get("width");
+            const height = raw.elements.get("height");
+            if (width !== undefined && height !== undefined && isAnyNumber(width) && isAnyNumber(height)) {
+                if (Number(width.getValue()) <= 0 || Number(height.getValue()) <= 0) {
+                    return false;
+                }
+            }
+        }
+        const clip = this.getValueJS("clippingRect") as { x: number; y: number; width: number; height: number };
+        if (!clip || clip.width <= 0 || clip.height <= 0) {
+            return false;
+        }
+        // Resolved only once a clip is known to be needed — `getDrawTranslation` allocates, and the
+        // node computes its own copy inside `renderNodeContent` anyway.
+        const drawTrans = this.getDrawTranslation(origin, angle);
+        draw2D.pushClip({
+            x: clip.x + drawTrans[0],
+            y: clip.y + drawTrans[1],
+            width: clip.width,
+            height: clip.height,
+        });
+        return true;
     }
 
     private updateContainerBounds(nodeTrans: number[], drawTrans: number[]) {
@@ -689,14 +897,72 @@ export class Group extends Node {
     }
 
     protected nodeRenderingDone(origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
-        this.updateParentRects(origin, angle);
-        this.updateRenderTracking(opacity === 0);
+        // An invisible node only reaches here on a measurement pass (skipRender lets it through
+        // when there is no draw target): its own rects were refreshed for bounding-rect queries,
+        // but it must not contribute to the parent's bounds nor report as rendered.
+        if (this.isVisible()) {
+            this.updateParentRects(origin, angle);
+        }
+        this.updateRenderTracking(opacity === 0 || !this.isVisible());
         // Mark node as clean after rendering
         if (draw2D) {
             this.isDirty = false;
         }
     }
 
+    /**
+     * Whether a pruned layout refresh may skip this settled subtree (docs/scenegraph-layout-passes.md).
+     * Active only during `refreshLayoutFromRoot`'s pruned pass (`sgRoot.pruneLayout`), never on
+     * paint. A subtree is skippable when nothing in it was written since its last layout pass
+     * (`subtreeStale` false — sound because layout passes are pure) AND the incoming
+     * origin/angle/opacity match the context that pass ran under. A skipped child must still hand
+     * its cached rect up: `updateBoundingRects` resets the parent's rects at the start of the
+     * parent's pass and rebuilds them from child unions, so skipping without contributing would
+     * make every ancestor's bounds come out short (a vertical LayoutGroup reporting one child's
+     * height instead of the stack's — MidRenderParentMeasure).
+     */
+    private skipSettledLayout(origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D): boolean {
+        if (draw2D || !sgRoot.pruneLayout || this.subtreeStale || !this.lastLayoutContext) {
+            return false;
+        }
+        const ctx = this.lastLayoutContext;
+        if (ctx.x !== origin[0] || ctx.y !== origin[1] || ctx.angle !== angle || ctx.opacity !== opacity) {
+            return false;
+        }
+        if (this.isVisible()) {
+            this.updateParentRects(origin, angle);
+        }
+        return true;
+    }
+
+    /**
+     * Whether renderNode must skip this node. Invisible nodes are skipped during frame draws
+     * (draw2D present). A layout/measurement pass (no draw target — e.g. getBoundingRect's
+     * refresh render) still traverses invisible plain containers so that nodes inside a hidden
+     * ancestor get their bounding rects computed: on Roku, layout and bounding rects are
+     * independent of visibility, and apps commonly measure UI before showing it (a component
+     * built while an ancestor screen group is still hidden, then centered via boundingRect()).
+     * Renderable/complex nodes (Poster, Label, ArrayGrid, …) keep their own hard skip when
+     * invisible so hidden UI does not load textures or create item components.
+     */
+    protected skipRender(draw2D?: IfDraw2D): boolean {
+        if (this.isVisible()) {
+            return false;
+        }
+        if (!draw2D) {
+            return false;
+        }
+        this.updateRenderTracking(true);
+        return true;
+    }
+
+    /**
+     * Runs on layout passes too (not gated on `isPaintPass`): tracking is a deterministic
+     * function of layout state (rects + visibility), the write only fires on a genuine change,
+     * and HiddenMeasure pins that a bounding-rect refresh reports "none" for UI measured under a
+     * hidden ancestor. That keeps layout passes idempotent without freezing tracking between
+     * frames.
+     */
     protected updateRenderTracking(invisible: boolean) {
         const enableRenderTracking = this.getValueJS("enableRenderTracking") as boolean;
         const renderTracking = this.getValueJS("renderTracking") as string;

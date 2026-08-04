@@ -14,12 +14,25 @@ import readline from "node:readline";
 import { Worker } from "node:worker_threads";
 import { gateway4sync } from "default-gateway";
 import envPaths from "env-paths";
-import { ImageData, createCanvas } from "canvas";
+import { ImageData } from "canvas";
 import chalk from "chalk";
 import { Command } from "commander";
 import stripAnsi from "strip-ansi";
 import { deviceData, loadAppZip, updateAppZip, subscribePackage, mountExt, setupDeepLink } from "./package";
-import { deriveMaxColumns, renderAsciiFrame, renderUnicodeFrame, printFrame } from "./display";
+import {
+    deriveMaxColumns,
+    enableFrameOutput,
+    disableFrameOutput,
+    renderFrameToTerminal,
+    frameToPng,
+    writeTerminalText,
+    suspendTextDeferral,
+    resumeTextDeferral,
+    setLogFile,
+    closeLogFile,
+} from "./display";
+import { startKeyboardControl, stopKeyboardControl, handleDebuggerCommand } from "./keyboard";
+import { startUpdateCheck, printUpdateNotice } from "./update";
 import { isNumber } from "../api/util";
 import {
     DebugPrompt,
@@ -31,10 +44,12 @@ import {
     SupportedExtension,
     isRegistryData,
     isGraphicsData,
+    isRendezvousEvent,
     ExtensionInfo,
     DataType,
     ExtVolInitialSize,
     ExtVolMaxSize,
+    LogLevel,
 } from "../core/common";
 import SharedObject from "../core/SharedObject";
 import { encryptPackage } from "../core/packageEncryption";
@@ -54,6 +69,7 @@ const BrsDevice = brs.BrsDevice;
 
 // Variables
 let appFileName = "";
+let lastFrame: ImageData | undefined;
 const extensions: ExtensionInfo[] = [];
 let brsWorker: Worker;
 let workerReady = false;
@@ -70,8 +86,16 @@ program
     .arguments(`brs-cli [brsFiles...]`)
     .option("-a, --ascii <columns>", "Enable ASCII screen mode with # of columns.")
     .option("-u, --unicode", "Render ASCII screen mode using Unicode block characters.", false)
+    .option(
+        "-i, --image [percent]",
+        "Render the screen as images on the terminal with optional width % (default: 100)."
+    )
+    .option("-s, --snapshot [filename]", "Enable Ctrl+S to save the current screen as a PNG image.")
     .option("-c, --colors <level>", "Define the console color level (0 to disable).", defaultLevel)
     .option("-d, --debug", "Developer mode: micro debugger on crash + resource tracking.", false)
+    .option("-l, --log [filename]", "Redirect the text output to a log file (default: brs-cli.log).")
+    .option("-g, --log-level <level>", "Set console log verbosity: debug, warning or error.", "warning")
+    .option("-z, --log-rendezvous", "Trace SceneGraph cross-thread rendezvous (like Roku's logrendezvous).", false)
     .option("-e, --ecp", "Enable the ECP server for control simulation.", false)
     .option("-n, --no-sg", "Disable the SceneGraph extension.")
     .option("-p, --pack <password>", "The password to generate the encrypted package.", "")
@@ -81,11 +105,23 @@ program
     .option("-k, --deep-link <params>", "Parameters to be passed to the application. (format: key=value,...)")
     .option("-y, --registry", "Persist the simulated device registry on disk.", false)
     .action(async (brsFiles, program) => {
+        if (typeof program.image === "string" && !isNumber(program.image)) {
+            // `-i <file>`: commander consumed the app path as the optional [percent]
+            // value; a percent is always numeric, so give the path back to the file list.
+            brsFiles.unshift(program.image);
+            program.image = true;
+        }
         if (!checkParameters()) {
             return;
         }
+        // Reads the cached npm registry result (and refreshes it in background when stale),
+        // so `printUpdateNotice()` can report a new release without adding startup latency.
+        startUpdateCheck();
         if (typeof deviceData === "object") {
-            deviceData.customFeatures.push("ascii_rendering");
+            // Custom feature that apps can inspect using `roDeviceInfo.hasFeature()` and change behavior when ran under CLI
+            deviceData.customFeatures.push("platform_cli");
+            // CLI does not support Video playback, this makes apps UI looks better in terminal
+            deviceData.autoPlayEnabled = false;
             deviceData.assets = fs.readFileSync(path.join(__dirname, "../assets/common.zip"))?.buffer;
             deviceData.localIps = getLocalIps();
             try {
@@ -97,6 +133,8 @@ program
             }
             deviceData.connectionInfo.dns = dns.getServers();
             deviceData.debugOnCrash = program.debug ?? false;
+            deviceData.logRendezvous = program.logRendezvous ?? false;
+            deviceData.logLevel = program.logLevel;
             if (program.registry) {
                 deviceData.registry = getRegistry();
             }
@@ -121,6 +159,33 @@ program
     .parse(process.argv);
 
 /**
+ * Parses a `--log-level`/`loglevel` REPL value into a `LogLevel`, accepting the level name
+ * (`debug`, `warning`/`warn`, `error`) or its underlying numeric value.
+ * @param value The raw value to parse, or undefined.
+ * @returns The parsed LogLevel, or undefined when `value` is not a recognized level.
+ */
+function parseLogLevel(value?: string): LogLevel | undefined {
+    const normalized = value?.trim().toLowerCase();
+    if (normalized === "debug" || normalized === "0") {
+        return LogLevel.Debug;
+    } else if (normalized === "warning" || normalized === "warn" || normalized === "1") {
+        return LogLevel.Warning;
+    } else if (normalized === "error" || normalized === "2") {
+        return LogLevel.Error;
+    }
+    return undefined;
+}
+
+/**
+ * Formats a `LogLevel` back into the lower-case name accepted by `--log-level`/`loglevel`.
+ * @param level The LogLevel to format.
+ * @returns The level's name (`debug`, `warning` or `error`).
+ */
+function logLevelName(level: LogLevel): string {
+    return LogLevel[level].toLowerCase();
+}
+
+/**
  * Validates and normalizes CLI parameters.
  * Sets default values for color level, ASCII mode, and validates file paths.
  * @returns True if all parameters are valid, false otherwise
@@ -130,6 +195,17 @@ function checkParameters() {
         chalk.level = Math.trunc(program.colors) as chalk.Level;
     } else {
         console.warn(chalk.yellow(`Invalid color level! Valid range is 0-3, keeping default: ${defaultLevel}.`));
+    }
+    const logLevel = parseLogLevel(program.logLevel);
+    if (logLevel === undefined) {
+        console.warn(
+            chalk.yellow(
+                `Invalid log level "${program.logLevel}"! Valid values are debug, warning, error, using default: warning.`
+            )
+        );
+        program.logLevel = LogLevel.Warning;
+    } else {
+        program.logLevel = logLevel;
     }
     if (program.ascii) {
         if (isNumber(program.ascii)) {
@@ -145,6 +221,21 @@ function checkParameters() {
         }
     } else if (program.unicode) {
         program.ascii = maxColumns;
+    }
+    if (program.image) {
+        // Optional width percent: `-i` alone means 100; `-i 60` scales the image to 60%
+        // of the terminal width (height follows the frame's aspect ratio).
+        let percent = 100;
+        if (typeof program.image === "string") {
+            if (isNumber(program.image) && +program.image >= 10 && +program.image <= 100) {
+                percent = Math.trunc(+program.image);
+            } else {
+                console.warn(
+                    chalk.yellow(`Invalid image width! Valid range is 10-100 (%), using default: ${percent}.`)
+                );
+            }
+        }
+        program.image = percent;
     }
     if (program.root && !fs.existsSync(program.root)) {
         console.error(chalk.red(`Root path not found: ${program.root}\n`));
@@ -272,6 +363,7 @@ function displayTitle() {
     /// #else
     console.log(`\n${appTitle} [${chalk.cyanBright(appVersion)}]\n`);
     /// #endif
+    printUpdateNotice();
 }
 
 /**
@@ -280,6 +372,9 @@ function displayTitle() {
  * @param payload - The application payload containing code, device info, and options
  */
 async function runApp(payload: AppPayload) {
+    // Covers the paths that don't display the title (`.brs` files and `--root` apps); it
+    // only prints once per process, and always before the frame output takes the terminal.
+    printUpdateNotice();
     payload.password = program.pack;
     if (program.ecp && !workerReady) {
         // Load ECP service as Worker
@@ -301,43 +396,132 @@ async function runApp(payload: AppPayload) {
         return;
     }
     try {
-        const pkg = await brs.executeFile(payload, {}, true);
+        let exitReason: AppExitReason;
+        if (program.pack.length > 0 && !isPackaged(payload)) {
+            // Packaging returns the encrypted data as a function result (not a message),
+            // so it runs in-process; there is no display loop and no Tasks to spawn.
+            const pkg = await brs.executeFile(payload, {}, true);
+            exitReason = pkg.exitReason;
+            if (pkg.exitReason === AppExitReason.Packaged) {
+                if (program.ecp) {
+                    brsWorker?.terminate();
+                }
+                await savePackage(pkg);
+                return;
+            }
+        } else {
+            // Run the app on a dedicated worker thread (render thread); this main thread stays
+            // free to broker SceneGraph Task rendezvous, keyboard input and the Micro Debugger.
+            payload.extensions = extensions.map((ext) => ext.name as SupportedExtension);
+            brs.subscribeHost("cli", hostCallback);
+            startKeyboardControl(
+                sharedArray,
+                () => brs.terminateApp(),
+                program.snapshot ? saveScreenshot : undefined,
+                program.debug
+            );
+            let logPath: string | undefined;
+            if (program.log) {
+                logPath = setLogFile(typeof program.log === "string" ? program.log : "brs-cli.log");
+            }
+            enableFrameOutput({
+                ascii: typeof program.ascii === "number" ? program.ascii : undefined,
+                unicode: program.unicode,
+                image: program.image,
+            });
+            try {
+                const result = await brs.executeApp(payload, { sharedBuffer });
+                exitReason = result.exitReason;
+            } finally {
+                disableFrameOutput();
+                closeLogFile();
+                stopKeyboardControl();
+                if (logPath) {
+                    console.log(chalk.blueBright(`Text output was logged to ${path.resolve(logPath)}\n`));
+                }
+            }
+        }
         if (program.ecp) {
             brsWorker?.terminate();
         }
-        if (pkg.exitReason === AppExitReason.Packaged) {
-            // Generate the Encrypted App Package
-            const filePath = path.join(program.out, appFileName.replaceAll(/.zip/gi, ".bpk"));
-            try {
-                // Encrypt the whole package container with the same password so the plaintext
-                // assets (images, fonts, data, manifest) are also protected at rest.
-                const buffer = await encryptPackage(
-                    updateAppZip(pkg.cipherText, pkg.iv, pkg.packedFiles),
-                    program.pack
-                );
-                fs.writeFileSync(filePath, buffer);
-                console.log(
-                    chalk.blueBright(
-                        `Package file created as ${filePath} with ${Math.round(buffer.length / 1024)} KB.\n`
-                    )
-                );
-            } catch (err: any) {
-                console.error(chalk.red(`Error generating the file ${filePath}: ${err.message}`));
-                process.exitCode = 1;
-            }
+        const msg = `------ Finished '${appFileName}' execution [${exitReason}] ------\n`;
+        if (exitReason === AppExitReason.UserNav) {
+            console.log(chalk.blueBright(msg));
         } else {
-            const msg = `------ Finished '${appFileName}' execution [${pkg.exitReason}] ------\n`;
-            if (pkg.exitReason === AppExitReason.UserNav) {
-                console.log(chalk.blueBright(msg));
-            } else {
-                process.exitCode = 1;
-                console.log(chalk.redBright(msg));
-            }
+            process.exitCode = 1;
+            console.log(chalk.redBright(msg));
         }
+        // On a first run the registry response usually arrives while the app is running,
+        // so report it here (no-op when the notice was already displayed at startup).
+        printUpdateNotice();
     } catch (err: any) {
         console.error(chalk.red(`Error executing app: ${err.message}`));
         process.exitCode = 1;
     }
+}
+
+/**
+ * Returns true when the payload is already an encrypted package (.bpk),
+ * which is executed (not re-packaged) even when a password is provided.
+ * @param payload - The application payload to inspect
+ */
+function isPackaged(payload: AppPayload) {
+    return Array.isArray(payload.paths) && payload.paths.some((filePath) => filePath.type === "pcode");
+}
+
+/**
+ * Writes the encrypted app package (.bpk) generated by the packaging run to disk.
+ * @param pkg - The packaging result with cipherText, iv and packed file list
+ */
+async function savePackage(pkg: brs.RunResult) {
+    const filePath = path.join(program.out, appFileName.replaceAll(/.zip/gi, ".bpk"));
+    try {
+        // Encrypt the whole package container with the same password so the plaintext
+        // assets (images, fonts, data, manifest) are also protected at rest.
+        const buffer = await encryptPackage(updateAppZip(pkg.cipherText, pkg.iv, pkg.packedFiles), program.pack);
+        fs.writeFileSync(filePath, buffer);
+        console.log(
+            chalk.blueBright(`Package file created as ${filePath} with ${Math.round(buffer.length / 1024)} KB.\n`)
+        );
+    } catch (err: any) {
+        console.error(chalk.red(`Error generating the file ${filePath}: ${err.message}`));
+        process.exitCode = 1;
+    }
+}
+
+/**
+ * Routes events from the worker host to the existing CLI message handlers.
+ * @param event - The host event name (message, frame, registry, graphics, ...)
+ * @param data - The event payload
+ */
+function hostCallback(event: string, data: any) {
+    if (event === "message" && typeof data === "string") {
+        if (data.startsWith("command,")) {
+            const command = data.slice(8).trimEnd();
+            // The debugger owns the terminal while the app is paused: release text
+            // deferral (flushing held messages) on stop, re-arm it on continue.
+            if (command === "stop") {
+                suspendTextDeferral();
+            } else if (command === "continue") {
+                resumeTextDeferral();
+            }
+            handleDebuggerCommand(command);
+        }
+        handleStringMessage(data);
+    } else if (["frame", "registry", "graphics", "rendezvous"].includes(event)) {
+        // The revived ImageData, RegistryData, GraphicsData and RendezvousEvent shapes are the
+        // same the in-process engine posts, so the existing message handler applies unchanged.
+        messageCallback(data);
+    } else if (event === "error") {
+        writeTerminalText(chalk.red(data) + "\n", true);
+    } else if (event === "warning") {
+        writeTerminalText(chalk.yellow(data) + "\n", true);
+    } else if (event === "stdout" || event === "stderr") {
+        // Console output written directly inside a worker (engine internals or third-party
+        // libraries): piped by the host so it never hits the terminal mid-frame.
+        writeTerminalText(data, event === "stderr");
+    }
+    // Host-internal "debug" diagnostics stay silent (matching the previous in-process output).
 }
 
 /**
@@ -435,6 +619,23 @@ async function repl() {
             process.stdout.write("\x1Bc");
         } else if (["help", "hint"].includes(line.toLowerCase().trim())) {
             printHelp();
+        } else if (["loglevel", "log-level"].includes(line.split(" ")[0]?.toLowerCase().trim())) {
+            const arg = line.split(" ")[1]?.trim();
+            if (arg) {
+                const parsed = parseLogLevel(arg);
+                if (parsed === undefined) {
+                    process.stdout.write(
+                        chalk.yellowBright(`\nInvalid log level "${arg}". Valid values: debug, warning, error.\n`)
+                    );
+                } else {
+                    BrsDevice.deviceInfo.logLevel = parsed;
+                    process.stdout.write(chalk.greenBright(`\nLog level set to: ${logLevelName(parsed)}\n`));
+                }
+            } else {
+                process.stdout.write(
+                    chalk.cyanBright(`\nCurrent log level: ${logLevelName(BrsDevice.deviceInfo.logLevel)}\n`)
+                );
+            }
         } else if (["vol", "vols"].includes(line.toLowerCase().trim())) {
             const vols = BrsDevice.fileSystem.volumesSync();
             process.stdout.write(chalk.cyanBright(`\nMounted volumes:\n\n`));
@@ -552,26 +753,19 @@ function packageCallback(event: string, data: any) {
 
 /**
  * Callback function for receiving messages from the interpreter.
- * Handles string messages, ImageData for ASCII rendering, and registry Map for persistence.
+ * Handles string messages, ImageData for ASCII/PNG rendering, and registry Map for persistence.
  * @param message - The message from interpreter (string, ImageData, or Map)
  * @param _ - Unused parameter
  */
 function messageCallback(message: any, _?: any) {
     if (typeof message === "string") {
         handleStringMessage(message);
-    } else if (program.ascii && message instanceof ImageData) {
-        const canvas = createCanvas(message.width, message.height);
-        const ctx = canvas.getContext("2d");
-        canvas.width = message.width;
-        canvas.height = message.height;
-        ctx.putImageData(message, 0, 0);
-        const columns = typeof program.ascii === "number" && program.ascii > 0 ? program.ascii : maxColumns;
-        if (program.unicode) {
-            printFrame(renderUnicodeFrame(columns, canvas));
-        } else {
-            printFrame(renderAsciiFrame(columns, canvas));
+    } else if (message instanceof ImageData) {
+        lastFrame = message;
+        if (program.ascii || program.image) {
+            renderFrameToTerminal(message);
         }
-    } else if (isGraphicsData(message)) {
+    } else if (isGraphicsData(message) || isRendezvousEvent(message)) {
         if (program.ecp) {
             brsWorker?.postMessage(message);
         }
@@ -594,6 +788,30 @@ function messageCallback(message: any, _?: any) {
 }
 
 /**
+ * Saves the current screen frame as a PNG image file.
+ * Triggered by the Ctrl+S shortcut when the `--snapshot` option is enabled.
+ */
+function saveScreenshot() {
+    if (!lastFrame) {
+        writeTerminalText(chalk.yellow("No frame was rendered by the app yet, no image saved.") + "\n", true);
+        return;
+    }
+    let filePath = typeof program.snapshot === "string" ? program.snapshot : "";
+    if (filePath === "") {
+        const appName = appFileName === "" ? "screen" : path.parse(appFileName).name;
+        filePath = `${appName}.png`;
+    } else if (path.extname(filePath).toLowerCase() !== ".png") {
+        filePath += ".png";
+    }
+    try {
+        fs.writeFileSync(filePath, frameToPng(lastFrame));
+        console.log(chalk.blueBright(`Screenshot saved as ${path.resolve(filePath)}\n`));
+    } catch (err: any) {
+        console.error(chalk.red(`Error saving the image ${filePath}: ${err.message}`));
+    }
+}
+
+/**
  * Parses and displays string messages from the interpreter.
  * Message format: "type,content" where type is print, warning, error, end, etc.
  * @param message - The message string to parse and display
@@ -604,18 +822,18 @@ function handleStringMessage(message: string) {
     if (mType === "print" && msg.endsWith(DebugPrompt)) {
         process.stdout.write(msg);
     } else if (mType === "print") {
-        process.stdout.write(colorize(msg));
+        writeTerminalText(colorize(msg));
     } else if (mType === "warning") {
-        console.warn(chalk.yellow(msg.trimEnd()));
+        writeTerminalText(chalk.yellow(msg.trimEnd()) + "\n", true);
     } else if (mType === "error") {
-        console.error(chalk.red(msg.trimEnd()));
+        writeTerminalText(chalk.red(msg.trimEnd()) + "\n", true);
         process.exitCode = 1;
     } else if (mType === "debug") {
-        console.debug(chalk.gray(msg.trimEnd()));
+        writeTerminalText(chalk.gray(msg.trimEnd()) + "\n");
     } else if (mType === "end" && msg.trimEnd() !== AppExitReason.UserNav) {
         process.exitCode = 1;
-    } else if (!["start", "command", "reset", "video", "audio", "syslog", "end"].includes(mType)) {
-        console.info(chalk.blueBright(message.trimEnd()));
+    } else if (!["start", "command", "reset", "video", "audio", "sfx", "syslog", "end"].includes(mType)) {
+        writeTerminalText(chalk.blueBright(message.trimEnd()) + "\n");
     }
 }
 
@@ -655,6 +873,7 @@ function printHelp() {
     helpMsg += "REPL Command List:\r\n";
     helpMsg += "   print|?           Print variable value or expression\r\n";
     helpMsg += "   var|vars [scope]  Display variables and their types/values\r\n";
+    helpMsg += "   loglevel [level]  Show or set the log level (debug, warning, error)\r\n";
     helpMsg += "   vol|vols          Display file system mounted volumes\r\n";
     helpMsg += "   mnt|mount <path>  Mount ext1: volume from directory or zip file\r\n";
     helpMsg += "   umt|umount        Unmount ext1: volume\r\n";

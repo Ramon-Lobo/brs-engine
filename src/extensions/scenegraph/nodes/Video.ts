@@ -29,6 +29,7 @@ import {
 } from "brs-engine";
 import { fromAssociativeArray, toAssociativeArray, jsValueOf } from "../factory/Serializer";
 import { sgRoot } from "../SGRoot";
+import { sgClock } from "../SGClock";
 import { BusySpinner } from "./BusySpinner";
 import { ContentNode } from "./ContentNode";
 import { Label } from "./Label";
@@ -36,7 +37,6 @@ import { Node } from "./Node";
 import { Poster } from "./Poster";
 import { ScrollingLabel } from "./ScrollingLabel";
 import { Timer } from "./Timer";
-import { rotateTranslation } from "../SGUtil";
 import { TrickPlayBar } from "./TrickPlayBar";
 import { ProgressBar } from "./ProgressBar";
 
@@ -112,6 +112,7 @@ export class Video extends Group {
         { name: "currentSubtitleTrack", type: "string", value: "" },
         { name: "availableSubtitleTracks", type: "array" },
         { name: "captionStyle", type: "assocarray" },
+        { name: "captionRenderArea", type: "assocarray" },
         { name: "mute", type: "boolean", value: "false" },
         { name: "audioTrack", type: "string", value: "" },
         { name: "currentAudioTrack", type: "string", value: "" },
@@ -149,6 +150,7 @@ export class Video extends Group {
     private seekTimeout: number;
     private statusChanged: boolean;
     private seeking: boolean;
+    private hasPresented: boolean;
 
     constructor(members: AAMember[] = [], readonly name: string = SGNodeType.Video) {
         super([], name);
@@ -200,10 +202,16 @@ export class Video extends Group {
         this.trickPlayPos = -1;
         this.seeking = false;
         this.statusChanged = false;
+        this.hasPresented = false;
         this.lastPressHandled = "";
 
-        // Prevent initializing Video in Task Thread
-        if (sgRoot.inTaskThread()) {
+        // Prevent initializing Video in a Task thread, and — critically — when this instance is being
+        // rebuilt as a cross-thread serialization proxy (`toSGNode`/`brsValueOf` on the render thread).
+        // The render-init below registers this instance as `sgRoot.video` and posts player-reset
+        // messages; a proxy doing so hijacks the root video (`processVideo` would drive the
+        // observer-less proxy, so a `Video` node's `state` observers stop firing — e.g. the SGDEX
+        // auto-close on "finished") and resets the real player. A proxy is a data carrier only.
+        if (sgRoot.inTaskThread() || sgRoot.deserializing) {
             return;
         }
         // Initialize Clock Timer
@@ -226,9 +234,17 @@ export class Video extends Group {
         postMessage({ supportCaptions: true });
         postMessage({ captionMode: BrsDevice.deviceInfo.captionMode });
         postMessage({ captionStyle: new Array<CaptionStyleOption>() });
+        postMessage({ captionRenderArea: { mode: "fullscreen" } });
 
-        // Set itself as the root video object
-        sgRoot.setVideo(this);
+        // Become the root video object only if none is active yet. A newly created Video must NOT
+        // steal event routing from a Video that is already playing: `processVideo` delivers the
+        // single shared player's events to `sgRoot.video`, so if a second Video (e.g. one the app
+        // builds while a startup logo is still playing) hijacked it here, the playing Video's
+        // `state` would never reach "finished"/"stopped" and its observers would be stranded.
+        // A Video that later starts playback claims the root in the `control` setter instead.
+        if (!sgRoot.video) {
+            sgRoot.setVideo(this);
+        }
     }
 
     get(index: BrsType) {
@@ -252,7 +268,27 @@ export class Video extends Group {
             const control = value.getValue().toLowerCase();
             if (validControl.includes(control)) {
                 this.checkContentChanged();
-                if (!sgRoot.inTaskThread()) postMessage(`video,${control}`);
+                if (!sgRoot.inTaskThread()) {
+                    // A playback-starting command makes this the active video that `processVideo`
+                    // routes the shared player's events to, taking over from any previous one.
+                    if (["play", "prebuffer", "resume", "replay"].includes(control) && sgRoot.video !== this) {
+                        sgRoot.setVideo(this);
+                    }
+                    // asyncStopSemantics (Roku OS 12.5+): a "stop" is non-blocking and reports its
+                    // progress through the state field — "stopping" the moment the stop begins, then
+                    // "stopped" once it completes. Apps use that transition to serialize a following
+                    // play/prebuffer (which needs the underlying player freed) behind the stop; without
+                    // the "stopping" edge, such an app never learns the stop started and its queued play
+                    // is dropped, leaving the next content unplayed. The completing "stopped" is emitted
+                    // by setState when the main thread's stop lands (MediaEvent.Partial). If the player
+                    // is already stopped there is no event to come, so settle synchronously instead of
+                    // stranding the node in "stopping".
+                    if (control === "stop" && this.getValueJS("asyncStopSemantics") === true) {
+                        const settled = this.getValueJS("state") === "stopped" || this.getValueJS("state") === "none";
+                        super.setValue("state", new BrsString(settled ? "stopped" : "stopping"));
+                    }
+                    postMessage(`video,${control}`);
+                }
             } else if (control !== "none") {
                 BrsDevice.stderr.write(`warning,${getNow()} [sg.video.cntrl.bad] control field set to invalid value`);
                 return;
@@ -305,6 +341,8 @@ export class Video extends Group {
             }
         } else if (fieldName === "captionstyle" && value instanceof RoAssociativeArray) {
             this.setCaptionStyle(fromAssociativeArray(value));
+        } else if (fieldName === "captionrenderarea" && value instanceof RoAssociativeArray) {
+            if (!sgRoot.inTaskThread()) postMessage({ captionRenderArea: fromAssociativeArray(value) });
         } else if (fieldName === "trickplaybackgroundoverlay") {
             this.backgroundOverlay.setValue("uri", value);
         }
@@ -312,7 +350,7 @@ export class Video extends Group {
     }
 
     setState(eventType: number, eventIndex: number) {
-        const now = Date.now();
+        const now = sgClock.now();
         this.statusChanged = true;
         let state = "none";
         switch (eventType) {
@@ -326,12 +364,14 @@ export class Video extends Group {
             case MediaEvent.StartStream:
             case MediaEvent.Resumed:
                 state = "playing";
+                this.hasPresented = true;
                 this.resetSeeking();
                 this.spinner.setValueSilent("visible", BrsBoolean.False);
                 if (eventType === MediaEvent.Resumed) this.showUI(false);
                 break;
             case MediaEvent.Paused:
                 state = "paused";
+                this.hasPresented = true;
                 this.spinner.setValueSilent("visible", BrsBoolean.False);
                 if (this.trickPlayPos === -1) {
                     this.showHeader = now + 5000;
@@ -341,16 +381,19 @@ export class Video extends Group {
                 break;
             case MediaEvent.Partial:
                 state = "stopped";
+                this.hasPresented = false;
                 break;
             case MediaEvent.Finished:
             case MediaEvent.Full:
                 this.spinner.setValueSilent("visible", BrsBoolean.False);
                 this.showUI(false);
                 state = "finished";
+                this.hasPresented = false;
                 break;
             case MediaEvent.Failed:
                 this.setErrorFields(eventIndex);
                 state = "error";
+                this.hasPresented = false;
                 if (!sgRoot.inTaskThread()) postMessage(`video,error`);
                 break;
             default:
@@ -363,6 +406,7 @@ export class Video extends Group {
 
     private resetContent(content: ContentNode) {
         if (sgRoot.inTaskThread()) return;
+        this.hasPresented = false;
         postMessage({ videoPlaylist: this.formatContent(content) });
         if (this.contentTitles.length > 0) {
             this.setContentIndex(0);
@@ -539,6 +583,17 @@ export class Video extends Group {
         }
     }
 
+    // The Video's children are all internal presentation nodes (trick-play bar, header
+    // labels, spinner, paused icon, background overlay, clock timer) created in the
+    // constructor and referenced by private fields that `showUI` updates every frame. They
+    // must never be serialized to a Task thread: a Task's `updateSGNode` reconciliation
+    // would replace them with fresh copies, splitting the rendered children from the fields
+    // being updated, and the overlay UI would stop appearing after the Task runs. A Task
+    // never renders, so it has no need for them. See Node.serializesChildren.
+    serializesChildren(): boolean {
+        return false;
+    }
+
     private isFullscreen(): boolean {
         const size = this.getDimensions();
         const width = size.width || this.sceneRect.width;
@@ -560,7 +615,7 @@ export class Video extends Group {
             this.showPaused = 0;
             this.showTrickPlay = 0;
         }
-        const now = Date.now();
+        const now = sgClock.now();
         this.backgroundOverlay.setValueSilent("visible", BrsBoolean.from(this.showHeader > now));
         this.titleText.setValue("visible", BrsBoolean.from(this.showHeader > now));
         this.clockText.setValueSilent("visible", BrsBoolean.from(this.showHeader > now));
@@ -593,7 +648,7 @@ export class Video extends Group {
                 handled = true;
             }
         } else if (key === "OK" && this.enableTrickPlay) {
-            const now = Date.now();
+            const now = sgClock.now();
             if (this.showHeader < now) {
                 this.showHeader = now + 5000;
                 handled = true;
@@ -611,7 +666,7 @@ export class Video extends Group {
             if (state === "playing") {
                 const position = this.getValueJS("position") as number;
                 if (position > 0) {
-                    const now = Date.now();
+                    const now = sgClock.now();
                     postMessage(`video,seek,${Math.max(0, position - 20) * 1000}`);
                     this.showHeader = now + 1000;
                     this.showTrickPlay = now + 1000;
@@ -686,7 +741,7 @@ export class Video extends Group {
     }
 
     private updateSeekStep(forward: boolean, duration: number, timeout = 0) {
-        const now = Date.now();
+        const now = sgClock.now();
         const baseStep = Math.min(10, Math.max(1, Math.trunc(duration / 30)));
         const step = baseStep * Math.max(1, this.seekLevel * 3 - 3);
         this.showHeader = now + 30000;
@@ -699,15 +754,18 @@ export class Video extends Group {
         }
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible() || sgRoot.inTaskThread()) {
             this.updateRenderTracking(true);
             return;
         }
-        const nodeTrans = this.getTranslation();
-        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const size = this.getDimensions();
         const rect = {
             x: drawTrans[0],
@@ -717,19 +775,56 @@ export class Video extends Group {
         };
         const rotation = angle + this.getRotation();
         opacity = opacity * this.getOpacity();
-        if (this.isDirty) {
-            postMessage(`video,rect,${rect.x},${rect.y},${rect.width},${rect.height}`);
+        // The whole engine shares a SINGLE browser <video> element, but an app can hold several
+        // Video node instances (e.g. a startup logo and a preview player). The video plane is a
+        // transparent hole cleared into the graphics buffer that the main thread fills with that one
+        // element's frames — so only the node that currently OWNS the element (`sgRoot.video`) and
+        // is presenting a frame (playing/paused, or re-buffering after playback began) may position
+        // it and punch the hole. A non-owner instance punches nothing and disappears cleanly: this
+        // prevents a second Video (or the just-finished startup logo) from resizing the element and
+        // leaking its stale last frame as a shrunken picture, and prevents a frame-less hole from
+        // showing through as a black box before the next screen renders.
+        //
+        // While the owner is INITIALLY buffering (loading, before the first frame has ever presented)
+        // a full-screen Video shows a black plane on Roku so the busy spinner appears over black. We
+        // must NOT clear a transparent hole here — the shared element may still hold a stale frame that
+        // would leak through — so we paint a solid black rect instead, gated on `uiVisible()` so it
+        // never reintroduces a black box over a windowed/preview Video.
+        //
+        // Once playback has actually started (`hasPresented`), a transient re-buffer must keep
+        // presenting the plane (the element still holds the last decoded frame), matching Roku where a
+        // mid-stream rebuffer shows the spinner over the frozen picture, not black. Without this, a
+        // media node whose `state` briefly flips to "buffering" — e.g. an SGDEX content handler / RAF
+        // Task mirroring the node cross-thread — would black out the plane for that frame and make a
+        // steadily-playing video flash black. `hasPresented` is driven only by real player events
+        // (setState), so those stray cross-thread `state` writes can never toggle it.
+        const state = this.getValueJS("state") as string;
+        const owner = sgRoot.video === this && opacity > 0;
+        const presenting =
+            owner && (state === "playing" || state === "paused" || (state === "buffering" && this.hasPresented));
+        const buffering = owner && state === "buffering" && !this.hasPresented && this.uiVisible();
+        // The video-plane rect postMessage, the ff/rw seek auto-repeat, and showUI's child field
+        // writes are paint-only: a layout pass (a bounding-rect refresh) must be pure — it would
+        // otherwise spam the host with rect messages and advance seek state per measurement.
+        if (this.isPaintPass(draw2D)) {
+            if (this.isDirty && presenting) {
+                postMessage(`video,rect,${rect.x},${rect.y},${rect.width},${rect.height}`);
+            }
+            if (this.statusChanged) {
+                if (this.seekTimeout > 0 && this.seekTimeout < sgClock.now() && ["rw", "ff"].includes(this.seekMode)) {
+                    const duration = this.getValueJS("duration") as number;
+                    this.updateSeekStep(this.seekMode === "ff", duration, Math.trunc(1000 / this.seekLevel));
+                }
+                this.showUI(this.uiVisible());
+            }
         }
         if (draw2D) {
             this.isDirty = false;
-            draw2D.doDrawClearedRect(rect);
-        }
-        if (this.statusChanged) {
-            if (this.seekTimeout > 0 && this.seekTimeout < Date.now() && ["rw", "ff"].includes(this.seekMode)) {
-                const duration = this.getValueJS("duration") as number;
-                this.updateSeekStep(this.seekMode === "ff", duration, Math.trunc(1000 / this.seekLevel));
+            if (presenting) {
+                draw2D.doDrawClearedRect(rect);
+            } else if (buffering) {
+                draw2D.doDrawRotatedRect(rect, 0x000000ff, 0, [0, 0], opacity);
             }
-            this.showUI(this.uiVisible());
         }
         this.updateBoundingRects(rect, origin, rotation);
         this.renderChildren(interpreter, drawTrans, rotation, opacity, draw2D);

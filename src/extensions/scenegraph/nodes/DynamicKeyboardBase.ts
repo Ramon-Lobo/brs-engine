@@ -3,7 +3,7 @@ import { FieldModel } from "../SGTypes";
 import { SGNodeType } from ".";
 import { Group } from "./Group";
 import { VoiceTextEditBox } from "./VoiceTextEditBox";
-import { DynamicKeyGrid } from "./DynamicKeyGrid";
+import { DynamicKeyGrid, DEFAULT_KEYBOARD_PALETTE } from "./DynamicKeyGrid";
 import { KeyInset, KeyLayout } from "./kdf/KeyDefinition";
 import { sgRoot } from "../SGRoot";
 
@@ -20,12 +20,14 @@ export class DynamicKeyboardBase extends Group {
         { name: "hideTextBox", type: "boolean", value: "false" },
         { name: "keyGrid", type: "node" },
         { name: "domain", type: "string", value: "generic" },
+        { name: "palette", type: "node" },
     ];
 
     readonly textEditBox: VoiceTextEditBox;
     readonly keyGrid: DynamicKeyGrid;
     private readonly textBoxHeight: number;
     private readonly gap: number;
+    private lastHideTextBox = false; // matches the hideTextBox default / textEditBox visible default
 
     constructor(initializedFields: AAMember[] = [], readonly name: string = SGNodeType.DynamicKeyboardBase) {
         super([], name);
@@ -95,7 +97,12 @@ export class DynamicKeyboardBase extends Group {
     }
 
     private layoutChildren(hideTextBox: boolean) {
-        this.textEditBox.setValueSilent("visible", BrsBoolean.from(!hideTextBox));
+        // Only sync `visible` when hideTextBox changes — an app may hide the box
+        // directly via textEditBox.visible, which must not be overwritten per frame.
+        if (this.lastHideTextBox !== hideTextBox) {
+            this.lastHideTextBox = hideTextBox;
+            this.textEditBox.setValueSilent("visible", BrsBoolean.from(!hideTextBox));
+        }
         this.textEditBox.setTranslation([0, 0]);
         this.keyGrid.setTranslation([0, hideTextBox ? 0 : this.textBoxHeight + this.gap]);
     }
@@ -199,6 +206,29 @@ export class DynamicKeyboardBase extends Group {
     // Input routing + rendering
     // -------------------------------------------------------------------------
 
+    /**
+     * Themes the keyboard from its resolved RSGPalette, mirroring how StandardDialog applies its
+     * palette to its parts. The DynamicKeyGrid resolves and applies its own key colors while it
+     * renders (walking up to the nearest palette), but the shared VoiceTextEditBox reads a plain
+     * `textColor` field — so push the resolved PrimaryTextColor onto it (with the same default
+     * fallback the key grid uses) so the typed text and PIN digits match the key labels under a
+     * custom palette. `resolvePaletteColor` walks from this node up to the nearest ancestor palette.
+     */
+    protected applyPalette() {
+        // Only theme from a palette when one is actually resolved in the scene graph; with no palette
+        // present the text box keeps its own `textColor` (default or app-set) rather than being forced
+        // to the default here.
+        if (!this.resolvePaletteColors()) {
+            return;
+        }
+        const primary = this.resolvePaletteColor("PrimaryTextColor", DEFAULT_KEYBOARD_PALETTE.PrimaryTextColor);
+        // `textColor` is the same Field the internal text label reads (linkField), so this themes the
+        // regular flowing text, the secure display, and the DynamicPinPad underline slots/digits.
+        // Colors are stored as signed 32-bit ints (`| 0`) so a high-alpha value like 0xFFFFFFFF is not
+        // clamped to 0x7FFFFFFF by Int32.
+        this.textEditBox.setValueSilent("textColor", new Int32(primary | 0));
+    }
+
     handleKey(key: string, press: boolean): boolean {
         if (!press) {
             return false;
@@ -209,7 +239,13 @@ export class DynamicKeyboardBase extends Group {
         return this.keyGrid.handleKey(key, press);
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible()) {
             this.updateRenderTracking(true);
             return;
@@ -218,8 +254,22 @@ export class DynamicKeyboardBase extends Group {
         const hideTextBox = this.getValueJS("hideTextBox") as boolean;
         this.syncSize();
         this.layoutChildren(hideTextBox);
+        this.applyPalette();
         this.textEditBox.setActive(focused);
         this.keyGrid.setFocusActive(focused);
-        super.renderNode(interpreter, origin, angle, opacity, draw2D);
+        super.renderNodeContent(interpreter, origin, angle, opacity, draw2D);
+        // Report the node's intrinsic size as its bounding rect (like the legacy Keyboard),
+        // not the children union: an app-hidden textEditBox still reserves its slot on Roku,
+        // so layout containers (e.g. a centered LayoutGroup) must keep measuring that space.
+        // Only hideTextBox collapses it, by moving the key grid to the top of the node.
+        const gridHeight = (this.keyGrid.getValueJS("height") as number) ?? 0;
+        const width = (this.getValueJS("width") as number) ?? 0;
+        const height = gridHeight + (hideTextBox ? 0 : this.textBoxHeight + this.gap);
+        if (width > 0 && height > 0) {
+            const nodeTrans = this.getTranslation();
+            const rect = { x: origin[0] + nodeTrans[0], y: origin[1] + nodeTrans[1], width, height };
+            this.updateBoundingRects(rect, origin, angle + this.getRotation());
+            this.updateParentRects(origin, angle);
+        }
     }
 }

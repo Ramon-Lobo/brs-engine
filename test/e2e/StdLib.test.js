@@ -10,11 +10,11 @@ describe("end to end standard library", () => {
     });
 
     afterEach(() => {
-        jest.resetAllMocks();
+        vi.clearAllMocks();
     });
 
     afterAll(() => {
-        jest.restoreAllMocks();
+        vi.restoreAllMocks();
     });
 
     test("stdlib/files.brs", async () => {
@@ -276,6 +276,9 @@ describe("end to end standard library", () => {
             "aa-box          roString        roString",
             "upper-box       String          roString",
             "left-box        String          roString",
+            "arr-reg         String          roString",
+            "arr-upper       String          roString",
+            "arr-set         String          roString",
         ]);
     });
     test("stdlib/end.brs", async () => {

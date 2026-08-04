@@ -65,6 +65,13 @@ export class BrsDevice {
     /** Current Thread ID for the environment */
     static threadId: number = 0;
 
+    /** True when the engine is running inside a worker thread (Web Worker or Node worker_threads).
+     * The Micro Debugger uses it to read commands from the shared array instead of blocking stdin. */
+    static isWorkerThread: boolean = false;
+
+    /** Monotonic counter published to the shared array by the render thread (see bumpRenderHeartbeat) */
+    private static renderHeartbeat: number = 0;
+
     /** External Storage Volume (ext1:) properties */
     private static extVolVersion: number = -1;
     private static extVolMounted: boolean = false;
@@ -398,6 +405,7 @@ export class BrsDevice {
      * @returns Debug command code
      */
     static checkBreakCommand(debugSession: boolean): number {
+        this.bumpRenderHeartbeat();
         // Serve on-demand graphics/texture-memory debug requests (r2d2-bitmaps). The
         // request flag is set in the shared buffer by the ECP/API thread; collect the
         // current texture memory state and post it back as a data object.
@@ -417,14 +425,52 @@ export class BrsDevice {
                 cmd = -1;
                 postMessage("command,continue");
             }
-            const dbt = Atomics.load(this.sharedArray, DataType.DBT);
-            if (dbt >= 0 && dbt !== this.threadId) {
-                // Another thread is in debug mode, pause this one
-                Atomics.wait(this.sharedArray, DataType.DBT, dbt);
+            if (this.pauseIfDebugging()) {
                 cmd = -1;
             }
         }
         return cmd;
+    }
+
+    /**
+     * Publishes the render thread's liveness for threads blocked on a rendezvous. Called from the
+     * per-statement poll, so the counter advances whenever the render thread is executing
+     * BrightScript — including a long stretch of app code that never returns to the message loop,
+     * which is the only place incoming rendezvous requests are served. Task threads never write it:
+     * a waiter must not keep its own execution from timing out.
+     */
+    private static bumpRenderHeartbeat() {
+        if (this.threadId === 0 && this.sharedArray.length > DataType.RHB) {
+            // Wrapped to int32 on purpose: only a *change* is meaningful, never the magnitude.
+            this.renderHeartbeat = (this.renderHeartbeat + 1) | 0;
+            Atomics.store(this.sharedArray, DataType.RHB, this.renderHeartbeat);
+        }
+    }
+
+    /**
+     * Reads the render thread's liveness counter. A change between two reads means the render
+     * thread executed BrightScript in the interim, so it is busy rather than stuck.
+     * @returns The current heartbeat value (0 when the shared array is not allocated).
+     */
+    static readRenderHeartbeat(): number {
+        return this.sharedArray.length > DataType.RHB ? Atomics.load(this.sharedArray, DataType.RHB) : 0;
+    }
+
+    /**
+     * Blocks the current thread while another thread owns the debug session, mirroring a real
+     * device where every thread freezes while the Micro Debugger is active. Used both by the
+     * per-statement/message-port poll (`checkBreakCommand`) and by the blocking cross-thread
+     * rendezvous waits, which would otherwise keep running (or time out) during a debug session.
+     * @returns True if this thread paused waiting for the debug session to end.
+     */
+    static pauseIfDebugging(): boolean {
+        const dbt = Atomics.load(this.sharedArray, DataType.DBT);
+        if (dbt >= 0 && dbt !== this.threadId) {
+            // Another thread is in debug mode, pause this one until the session ends.
+            Atomics.wait(this.sharedArray, DataType.DBT, dbt);
+            return true;
+        }
+        return false;
     }
 
     /**
@@ -461,6 +507,19 @@ export class BrsDevice {
         postMessage("command,continue");
         Atomics.store(this.sharedArray, DataType.DBT, -1);
         Atomics.notify(this.sharedArray, DataType.DBT);
+    }
+
+    /**
+     * Discards any buffered-but-undelivered key events and resets the press/release
+     * debounce state. Call this when a screen closes, so a key event still in flight
+     * for that screen (e.g. the release half of a press/release pair) is not later
+     * delivered to a different screen that becomes active next, as would never happen
+     * on a real device where key events are scoped to the currently displayed screen.
+     */
+    static resetKeysBuffer() {
+        this.keysBuffer.length = 0;
+        this.lastKey = -1;
+        this.lastMod = -1;
     }
 
     /**

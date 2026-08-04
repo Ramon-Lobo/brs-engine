@@ -76,7 +76,9 @@ export class MarkupList extends ArrayGrid {
         if (this.wrap) {
             nextIndex = this.getIndex(offset);
         }
-        if (nextIndex >= 0 && nextIndex < this.content.length) {
+        // A wrap on a single-item list resolves to the focused index itself: the move is a no-op
+        // and must NOT report handled, so the key bubbles to an ancestor's onKeyEvent.
+        if (nextIndex >= 0 && nextIndex < this.content.length && nextIndex !== this.focusIndex) {
             const itemIndex = this.metadata[nextIndex]?.index ?? nextIndex;
             this.setValue("animateToItem", new Int32(itemIndex));
             handled = true;
@@ -150,17 +152,32 @@ export class MarkupList extends ArrayGrid {
             this.renderItemComponent(interpreter, index, itemRect, rotation, opacity, draw2D);
             lastIndex = index;
             itemRect.x = rect.x;
-            itemRect.y += itemRect.height + (rowSpacings[r] ?? spacing[1]);
+            // Per-row overrides are indexed by ABSOLUTE row, top to bottom — not by the display slot,
+            // which differs as soon as the list is scrolled (rowHeights above already does this).
+            itemRect.y += itemRect.height + (rowSpacings[rowIndex] ?? spacing[1]);
             if (!RectRect(this.sceneRect, itemRect)) {
                 break;
             }
         }
-        this.updateRect(rect, displayRows, itemSize);
+        this.updateRect(rect, displayRows, itemSize, { firstRow: Math.max(0, this.getRenderRowIndex(0)) });
     }
 
     protected focusMargins() {
         // Like LabelList, a MarkupList is a short-row list: use the grid's marginX/marginY, not the
         // 9-patch's own 19px content margins, so the focus frame hugs the row instead of overflowing.
         return { left: this.marginX, right: this.marginX, top: this.marginY, bottom: this.marginY };
+    }
+
+    /**
+     * Like MarkupGrid, a real device reports a MarkupList's bounding rect as exactly the laid-out
+     * item extent (rows of itemSize plus spacing) with NO focus-bitmap outset. The outset would
+     * also be unstable: renderFocus re-derives hasNinePatch from whichever bitmap was drawn last,
+     * so a list whose focus bitmap is a 9-patch but whose footprint is a plain image would grow
+     * when focused and shrink when not — visibly shifting siblings a LayoutGroup places below it.
+     * The marginX/marginY outset still drives the drawn focus frame (focusMargins), just not the
+     * reported rects.
+     */
+    protected rectMargins(): { x: number; y: number } {
+        return { x: 0, y: 0 };
     }
 }

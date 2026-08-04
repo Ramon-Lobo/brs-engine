@@ -1,5 +1,5 @@
 // Mock the resolvedOptions method of Intl.DateTimeFormat
-global.Intl.DateTimeFormat = jest.fn().mockImplementation(() => {
+global.Intl.DateTimeFormat = vi.fn().mockImplementation(() => {
     return {
         resolvedOptions: () => {
             return {
@@ -10,10 +10,12 @@ global.Intl.DateTimeFormat = jest.fn().mockImplementation(() => {
 });
 const brs = require("../../../packages/node/bin/brs.node");
 const { Interpreter, netlib } = brs;
+const { BrsDevice } = brs;
 const { RoDeviceInfo, RoAssociativeArray, RoArray, BrsBoolean, BrsString, Int32, Int64 } = brs.types;
 
 describe("RoDeviceInfo", () => {
     const OLD_ENV = process.env;
+    let interpreter;
 
     beforeEach(() => {
         process.env = { ...OLD_ENV };
@@ -606,18 +608,48 @@ describe("RoDeviceInfo", () => {
             });
         });
         describe("isAutoPlayEnabled", () => {
-            it("should return false as auto play is not supported", () => {
+            it("should return true as auto play is enabled by default", () => {
                 let deviceInfo = new RoDeviceInfo(interpreter);
                 let method = deviceInfo.getMethod("isAutoPlayEnabled");
 
                 expect(method).toBeTruthy();
-                expect(method.call(interpreter)).toEqual(BrsBoolean.False);
+                expect(method.call(interpreter)).toEqual(BrsBoolean.True);
+            });
+            it("should reflect the configurable autoPlayEnabled device setting", () => {
+                const original = BrsDevice.deviceInfo.autoPlayEnabled;
+                try {
+                    BrsDevice.deviceInfo.autoPlayEnabled = false;
+                    let deviceInfo = new RoDeviceInfo(interpreter);
+                    let method = deviceInfo.getMethod("isAutoPlayEnabled");
+
+                    expect(method.call(interpreter)).toEqual(BrsBoolean.False);
+                } finally {
+                    BrsDevice.deviceInfo.autoPlayEnabled = original;
+                }
             });
         });
         describe("IsAutoAdjustRefreshRateEnabled", () => {
             it("should return false as auto adjust refresh rate is not supported", () => {
                 let deviceInfo = new RoDeviceInfo(interpreter);
                 let method = deviceInfo.getMethod("IsAutoAdjustRefreshRateEnabled");
+
+                expect(method).toBeTruthy();
+                expect(method.call(interpreter)).toEqual(BrsBoolean.False);
+            });
+        });
+        describe("isHDMIConnected", () => {
+            it("should return true as a simulated player is treated as connected", () => {
+                let deviceInfo = new RoDeviceInfo(interpreter);
+                let method = deviceInfo.getMethod("isHDMIConnected");
+
+                expect(method).toBeTruthy();
+                expect(method.call(interpreter)).toEqual(BrsBoolean.True);
+            });
+        });
+        describe("isPassthruCodecActive", () => {
+            it("should return false as audio is decoded locally", () => {
+                let deviceInfo = new RoDeviceInfo(interpreter);
+                let method = deviceInfo.getMethod("isPassthruCodecActive");
 
                 expect(method).toBeTruthy();
                 expect(method.call(interpreter)).toEqual(BrsBoolean.False);

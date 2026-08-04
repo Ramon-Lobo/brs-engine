@@ -19,13 +19,13 @@ exports.resourceFile = function (...filenameParts) {
 };
 
 /**
- * Extracts all arguments from all calls to a Jest mock function.
- * @param jestMock the mock to extract arguments from
- * @returns an array containing every argument from every call to a Jest mock.
+ * Extracts all arguments from all calls to a mock function.
+ * @param mockFn the mock to extract arguments from
+ * @returns an array containing every argument from every call to the mock.
  */
-exports.allArgs = function (jestMock) {
+exports.allArgs = function (mockFn) {
     return (
-        jestMock.mock.calls
+        mockFn.mock.calls
             // flatten arguments to `stdout.write` into a single array
             .reduce((allArgs, thisCall) => allArgs.concat(thisCall), [])
     );
@@ -39,8 +39,8 @@ exports.createMockStreams = function () {
     return {
         stdout,
         stderr,
-        stdoutSpy: jest.spyOn(stdout, "write").mockImplementation(() => {}),
-        stderrSpy: jest.spyOn(stderr, "write").mockImplementation(() => {}),
+        stdoutSpy: vi.spyOn(stdout, "write").mockImplementation(() => {}),
+        stderrSpy: vi.spyOn(stderr, "write").mockImplementation(() => {}),
         post: false,
     };
 };

@@ -70,6 +70,39 @@ describe("RoAssociativeArray", () => {
 
             expect(aa.get(new BrsString("foo"))).toEqual(new BrsString("not ninetynine", false, true));
         });
+
+        it("keeps a replaced key's enumeration position (for each + assign must not skip keys)", () => {
+            // Roku does not reorder an AA when an existing key's value is replaced. A delete +
+            // re-insert moved the key to the end of the backing Map, so a `for each` that assigns
+            // to existing keys of the same AA skipped entries (an options-merge loop).
+            let aa = new RoAssociativeArray([
+                { name: new BrsString("method"), value: new BrsString("GET") },
+                { name: new BrsString("params"), value: new RoAssociativeArray([]) },
+                { name: new BrsString("body"), value: new BrsString("") },
+                { name: new BrsString("headers"), value: new RoAssociativeArray([]) },
+                { name: new BrsString("retries"), value: new Int32(3) },
+            ]);
+
+            const visited = [];
+            aa.resetNext();
+            for (let i = 0; i < 20 && aa.hasNext().toBoolean(); i++) {
+                const key = aa.getNext();
+                visited.push(key.toString());
+                aa.set(key, new BrsString("replaced"));
+            }
+
+            expect(visited).toEqual(["method", "params", "body", "headers", "retries"]);
+        });
+
+        it("re-cases the stored key on a replace with different casing (last write wins)", () => {
+            let aa = new RoAssociativeArray([{ name: new BrsString("x"), value: new Int32(123) }]);
+
+            aa.set(new BrsString("X"), new Int32(456), true);
+
+            expect(aa.elements.size).toBe(1);
+            expect([...aa.elements.keys()]).toEqual(["X"]);
+            expect(aa.get(new BrsString("x")).getValue()).toBe(456);
+        });
     });
 
     describe("methods", () => {
@@ -243,6 +276,33 @@ describe("RoAssociativeArray", () => {
                 expect(keys).toBeTruthy();
 
                 let result = keys.call(interpreter);
+                expect(result.elements).toEqual(new RoArray([]).elements);
+            });
+        });
+
+        describe("values", () => {
+            it("returns the values ordered by their keys, not by value", () => {
+                let aa = new RoAssociativeArray([
+                    { name: new BrsString("zebra"), value: new BrsString("apple") },
+                    { name: new BrsString("apple"), value: new BrsString("zebra") },
+                    { name: new BrsString("mango"), value: new BrsString("mango") },
+                ]);
+
+                let values = aa.getMethod("values");
+                expect(values).toBeTruthy();
+
+                let result = values.call(interpreter);
+                // keys sorted -> apple, mango, zebra => values zebra, mango, apple
+                expect(result.elements.map((e) => e.toString())).toEqual(["zebra", "mango", "apple"]);
+            });
+
+            it("returns an empty array from an empty associative array", () => {
+                let aa = new RoAssociativeArray([]);
+
+                let values = aa.getMethod("values");
+                expect(values).toBeTruthy();
+
+                let result = values.call(interpreter);
                 expect(result.elements).toEqual(new RoArray([]).elements);
             });
         });

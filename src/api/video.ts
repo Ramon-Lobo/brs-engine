@@ -41,6 +41,10 @@ let videoMuted = false;
 let uiMuted = false;
 let previousBuffered = 0;
 let previousTime = Date.now();
+const DEFAULT_MIN_VIDEO_BUFFER_MS = 700; // fallback floor if DeviceInfo omits minVideoBufferMs
+let bufferFloorStart = 0; // Date.now() when the current load began
+let playFloorTimer: ReturnType<typeof setTimeout> | undefined; // pending deferred play
+let priming = false; // HLS audio-track priming play in flight; suppress its "playing" side effects
 const audioTracks: MediaTrack[] = [];
 const textTracks: MediaTrack[] = [];
 
@@ -58,16 +62,34 @@ if (typeof document !== "undefined") {
 export function initVideoModule(array: Int32Array, deviceInfo: DeviceInfo, mute: boolean = false) {
     if (player) {
         player.addEventListener("canplay", (e: Event) => {
-            loadProgress = 1000;
-            Atomics.store(sharedArray, DataType.VLP, loadProgress);
+            // Publish load progress only while a load is in progress (loadVideo resets it to 0
+            // per load): canplay also refires after every seek and when the buffer refills
+            // during playback, and per the Roku spec bufferingStatus / state "buffering" are
+            // only valid at stream startup or during an actual rebuffer — a republished 1000
+            // would surface as a spurious buffering transition that resets the trick-play
+            // state machine (stuck spinner, pause/FF/REW keys gated off).
+            if (loadProgress < 1000) {
+                loadProgress = 1000;
+                Atomics.store(sharedArray, DataType.VLP, loadProgress);
+            }
             canPlay = true;
             if (playerState !== "play" && !bufferOnly) {
                 playVideo();
             }
         });
         player.addEventListener("playing", (e: Event) => {
+            if (priming) {
+                // HLS audio-track priming play: halt immediately and report nothing to the
+                // worker (no StartStream, no notifyAll("play") — playerState stays non-"play"
+                // so the canplay handler still routes the real start through the buffering
+                // floor). The actual playback begins later via beginPlayback().
+                priming = false;
+                player.pause();
+                return;
+            }
             if (playerState !== "pause") {
                 setAudioTrack(playList[playIndex]?.audioTrack ?? -1);
+                // VDX must be stored before VDO — VDO is the publish flag the worker consumes.
                 Atomics.store(sharedArray, DataType.VDX, currentFrame);
                 Atomics.store(sharedArray, DataType.VDO, MediaEvent.StartStream);
             }
@@ -166,7 +188,7 @@ export function handleVideoEvent(eventData: string) {
     const data = eventData.split(",");
     if (data[1] === "play") {
         playVideo();
-    } else if (data[1] === "load") {
+    } else if (data[1] === "load" || data[1] === "prebuffer") {
         loadVideo(true);
     } else if (data[1] === "rect" && data.length === 6) {
         notifyAll("rect", {
@@ -324,8 +346,22 @@ export function addVideoPlaylist(newList: any[]) {
  */
 export function resetVideo() {
     stopVideo();
-    if (player.src.startsWith("blob:")) {
-        revokeVideoURL(player.src);
+    if (player) {
+        // stopVideo() is a no-op once a video has finished or was already stopped
+        // (playerState === "stop"), which leaves the previous video's source, buffered
+        // frames and text tracks attached to the shared player element. Release them
+        // unconditionally here so nothing bleeds into the next app that gets loaded.
+        if (hls) {
+            destroyHls();
+        }
+        if (player.src.startsWith("blob:")) {
+            revokeVideoURL(player.src);
+        }
+        if (player.getAttribute("src") !== null) {
+            player.removeAttribute("src");
+            player.load();
+        }
+        clearVideoTracking();
     }
     playList = new Array();
     packageVideos = new Map();
@@ -335,6 +371,10 @@ export function resetVideo() {
     startPosition = 0;
     playerState = "stop";
     videosState = false;
+    bufferOnly = false;
+    canPlay = false;
+    clearPlayFloor(); // stopVideo() is a no-op when already stopped, so clear unconditionally here
+    priming = false;
 }
 
 /**
@@ -356,8 +396,12 @@ function startProgress(e: Event) {
             startPosition = 0;
         }
     }
-    loadProgress += 200;
-    Atomics.store(sharedArray, DataType.VLP, loadProgress);
+    // Only progress an in-flight load: durationchange can refire after playback started
+    // (e.g. HLS updates while paused) and must not publish stale load progress.
+    if (loadProgress < 1000) {
+        loadProgress += 200;
+        Atomics.store(sharedArray, DataType.VLP, loadProgress);
+    }
 }
 
 /**
@@ -423,7 +467,14 @@ function loadAudioTracks() {
         playList[playIndex].audioTrack = activeTrack;
         if (activeTrack > -1 && playerState !== "play") {
             player.currentTime = 1; // Force HLS to load audio track
-            player.play();
+            // This play() only primes the audio-track load; the "playing" handler pauses it and
+            // swallows its side effects (priming flag), so the real start still goes through the
+            // buffering floor and prebuffer never starts audible playback.
+            priming = true;
+            const promise = player.play();
+            promise?.catch(() => {
+                priming = false; // autoplay rejection: no "playing" event will fire to swallow
+            });
         }
     }
     return activeTrack;
@@ -530,6 +581,11 @@ function loadVideo(buffer = false) {
     const video = playList[playIndex];
     if (video && player) {
         notifyAll("load");
+        // Start the buffering floor now and cancel any deferred play from the previous content,
+        // so a rapid navigation can never fire a stale play onto the wrong item.
+        bufferFloorStart = Date.now();
+        clearPlayFloor();
+        priming = false; // a stale armed priming flag would swallow this load's first real "playing"
         let videoSrc = getVideoUrl(video);
         clearVideoTracking();
         bufferOnly = buffer;
@@ -603,28 +659,75 @@ function getVideoUrl(video: any): string {
 }
 
 /**
+ * Cancels any pending deferred play scheduled by the buffering floor.
+ */
+function clearPlayFloor() {
+    if (playFloorTimer !== undefined) {
+        clearTimeout(playFloorTimer);
+        playFloorTimer = undefined;
+    }
+}
+
+/**
  * Plays the loaded video.
  * Loads video first if not ready, handles autoplay restrictions.
  */
 function playVideo() {
     if (canPlay) {
-        previousBuffered = 0;
-        previousTime = Date.now();
-        const promise = player.play();
-        if (promise !== undefined) {
-            promise
-                .then(function () {
-                    player.muted = uiMuted || videoMuted;
-                })
-                .catch(function (error) {
-                    notifyAll(
-                        "warning",
-                        `[video] Browser prevented the auto-play, press pause and play to start the video.`
-                    );
-                });
-        }
+        scheduleBufferedPlay();
     } else {
         loadVideo();
+    }
+}
+
+/**
+ * Enforces a minimum buffering floor before actual playback starts, mirroring a real Roku
+ * device where network buffering guarantees a visible gap before the video appears. The floor
+ * is measured from load-start (see loadVideo), so it is self-limiting: real network video
+ * already spends longer than the floor loading and incurs no added latency, while instant
+ * (cached/local) sources are held back just enough to let a preceding poster overlay render
+ * first, restoring the "poster first, then video" ordering.
+ */
+function scheduleBufferedPlay() {
+    clearPlayFloor();
+    const floor = deviceData?.minVideoBufferMs ?? DEFAULT_MIN_VIDEO_BUFFER_MS;
+    const remaining = floor - (Date.now() - bufferFloorStart);
+    if (remaining <= 0) {
+        beginPlayback();
+    } else {
+        playFloorTimer = setTimeout(() => {
+            playFloorTimer = undefined;
+            // A stop or a new load cancels this timer via clearPlayFloor(); canPlay guards
+            // against the source having been torn down while the floor was pending.
+            if (canPlay) {
+                beginPlayback();
+            }
+        }, remaining);
+    }
+}
+
+/**
+ * Starts the actual media playback and handles autoplay restrictions.
+ */
+function beginPlayback() {
+    // A real start supersedes any pending priming pause: if the floor elapses before the
+    // priming "playing" event fires, that single event must take the normal branch and
+    // publish StartStream (play() on an already-playing element fires no second event).
+    priming = false;
+    previousBuffered = 0;
+    previousTime = Date.now();
+    const promise = player.play();
+    if (promise !== undefined) {
+        promise
+            .then(function () {
+                player.muted = uiMuted || videoMuted;
+            })
+            .catch(function (error) {
+                notifyAll(
+                    "warning",
+                    `[video] Browser prevented the auto-play, press pause and play to start the video.`
+                );
+            });
     }
 }
 
@@ -695,6 +798,8 @@ function stopVideo(error?: boolean) {
         clearVideoTracking();
         startPosition = 0;
         canPlay = false;
+        clearPlayFloor(); // drop any pending deferred play so it can't fire after stop
+        priming = false; // a stop before the priming "playing" fires must not leave the flag armed
     }
 }
 
@@ -707,6 +812,7 @@ function pauseVideo() {
         player.pause();
         notifyAll("pause");
         Atomics.store(sharedArray, DataType.VDO, MediaEvent.Paused);
+        clearPlayFloor(); // pausing during the buffering floor drops the deferred start
     }
 }
 

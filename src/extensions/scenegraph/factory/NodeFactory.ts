@@ -110,9 +110,9 @@ import {
     ColorFieldInterpolator,
     Vector2DFieldInterpolator,
 } from "../nodes";
-import type { Field } from "../nodes/Field";
+import { Field } from "../nodes/Field";
 import { ComponentDefinition, ComponentNode } from "../parser/ComponentDefinition";
-import { brsValueOf } from "./Serializer";
+import { brsValueOf, replayPortNodeEvents } from "./Serializer";
 import { sgRoot } from "../SGRoot";
 import { convertHexColor, convertLong, convertNumber } from "../SGUtil";
 import { FieldAliasTarget, FieldKind, ObservedField } from "../SGTypes";
@@ -447,6 +447,14 @@ function createNodeByTypeDef(typeDef: ComponentDefinition, subtype: string): Nod
                 }
                 node.addNodeField(fieldName, fieldValue.type, fieldValue.alwaysNotify === "true", false);
             }
+            // Flat/deserialized nodes skip initializeNode(), so establish the `m` context here
+            // (top/global) that a custom component's script functions expect. Without it, invoking
+            // a public function via callFunc on a cross-thread-restored or cloned node runs with an
+            // empty `m`, so `m.top` is invalid and the call crashes.
+            const mPointer = new RoAssociativeArray([]);
+            mPointer.set(new BrsString("top"), node);
+            mPointer.set(new BrsString("global"), sgRoot.mGlobal);
+            node.m = mPointer;
         }
     }
     return node;
@@ -545,65 +553,78 @@ export function initializeNode(
         }
         // Add children, fields and call each init method starting from the
         // "basemost" component of the tree.
-        while (typeDef) {
-            interpreter.inSubEnv((subInterpreter) => {
+        //
+        // Mark the whole init scope so engine-initiated focus emissions raised here (a component's
+        // init calling setFocus, or a focus-before-attach chain repair) are recorded and deferred:
+        // on Roku those focus observers dispatch from the MESSAGE LOOP after init returns, so an
+        // observer registered LATER in the same init still catches them. Nesting is handled by
+        // initDepth — a child component created inside this init re-enters initializeNode; the
+        // pending notifications are delivered from the extension `tick` hook once initDepth is 0
+        // (see Field.enterInit/exitInit and Field.deliverPendingInitFocus).
+        Field.enterInit();
+        try {
+            while (typeDef) {
+                interpreter.inSubEnv((subInterpreter) => {
+                    if (node instanceof Scene) {
+                        node.setInitState("initializing");
+                    }
+                    addChildren(subInterpreter, node!, typeDef!);
+                    addFields(subInterpreter, node!, typeDef!);
+                    return BrsInvalid.Instance;
+                }, currentEnv);
+
+                // Pre-render default state of the tree (layout only — nothing to draw yet).
                 if (node instanceof Scene) {
-                    node.setInitState("initializing");
+                    node.layoutNode(interpreter, [0, 0], 0, 1);
                 }
-                addChildren(subInterpreter, node!, typeDef!);
-                addFields(subInterpreter, node!, typeDef!);
-                return BrsInvalid.Instance;
-            }, currentEnv);
 
-            // Pre-render default state of the tree.
-            if (node instanceof Scene) {
-                node.renderNode(interpreter, [0, 0], 0, 1);
-            }
+                const init = interpreter.inSubEnv((subInterpreter: Interpreter) => {
+                    return subInterpreter.getCallableFunction("init");
+                }, typeDef.environment);
 
-            const init = interpreter.inSubEnv((subInterpreter: Interpreter) => {
-                return subInterpreter.getCallableFunction("init");
-            }, typeDef.environment);
+                interpreter.inSubEnv((subInterpreter: Interpreter) => {
+                    subInterpreter.environment.hostNode = node;
 
-            interpreter.inSubEnv((subInterpreter: Interpreter) => {
-                subInterpreter.environment.hostNode = node;
-
-                mPointer.set(new BrsString("top"), node!);
-                mPointer.set(new BrsString("global"), sgRoot.mGlobal);
-                subInterpreter.environment.setM(mPointer);
-                subInterpreter.environment.setRootM(mPointer);
-                node!.m = mPointer;
-                if (init instanceof Callable) {
-                    const originalLocation = interpreter.location;
-                    const funcLoc = init.getLocation() ?? originalLocation;
-                    interpreter.addToStack({
-                        functionName: "init",
-                        functionLocation: funcLoc,
-                        callLocation: originalLocation,
-                        signature: init.signatures[0].signature,
-                    });
-                    try {
-                        node!.location = interpreter.formatLocation(funcLoc);
-                        init.call(subInterpreter);
-                        interpreter.popFromStack();
-                        interpreter.location = originalLocation;
-                    } catch (err) {
-                        if (err instanceof RuntimeError) {
-                            interpreter.checkCrashDebug(err);
-                        }
-                        if (!interpreter.inExitMode()) {
+                    mPointer.set(new BrsString("top"), node!);
+                    mPointer.set(new BrsString("global"), sgRoot.mGlobal);
+                    subInterpreter.environment.setM(mPointer);
+                    subInterpreter.environment.setRootM(mPointer);
+                    node!.m = mPointer;
+                    if (init instanceof Callable) {
+                        const originalLocation = interpreter.location;
+                        const funcLoc = init.getLocation() ?? originalLocation;
+                        interpreter.addToStack({
+                            functionName: "init",
+                            functionLocation: funcLoc,
+                            callLocation: originalLocation,
+                            signature: init.signatures[0].signature,
+                        });
+                        try {
+                            node!.location = interpreter.formatLocation(funcLoc);
+                            init.call(subInterpreter);
                             interpreter.popFromStack();
                             interpreter.location = originalLocation;
+                        } catch (err) {
+                            if (err instanceof RuntimeError) {
+                                interpreter.checkCrashDebug(err);
+                            }
+                            if (!interpreter.inExitMode()) {
+                                interpreter.popFromStack();
+                                interpreter.location = originalLocation;
+                            }
+                            throw err;
                         }
-                        throw err;
                     }
-                }
-                return BrsInvalid.Instance;
-            }, currentEnv);
+                    return BrsInvalid.Instance;
+                }, currentEnv);
 
-            typeDef = typeDefStack.pop();
-        }
-        if (node instanceof Scene) {
-            node.setInitState("initialized");
+                typeDef = typeDefStack.pop();
+            }
+            if (node instanceof Scene) {
+                node.setInitState("initialized");
+            }
+        } finally {
+            Field.exitInit();
         }
         return node;
     } else {
@@ -701,6 +722,20 @@ export function initializeTask(interpreter: Interpreter, taskData: TaskData) {
 }
 
 /**
+ * Maps the address a node was serialized under to this thread's instance of it, so circular
+ * references elsewhere in the same payload resolve to the live node.
+ * @param nodeMap Address map being built.
+ * @param source Serialized node representation, if present.
+ * @param node This thread's instance of that node.
+ */
+function registerSerializedAddress(nodeMap: Map<string, Node>, source: any, node: Node | undefined) {
+    const address: unknown = source?.["_address_"];
+    if (node && typeof address === "string") {
+        nodeMap.set(address, node);
+    }
+}
+
+/**
  * Restores task fields and context from serialized task data.
  * Sets up the task's m pointer, global state, and scene reference.
  * Restores field observers and message port connections.
@@ -710,24 +745,44 @@ export function initializeTask(interpreter: Interpreter, taskData: TaskData) {
  */
 function loadTaskData(interpreter: Interpreter, node: Node, taskData: TaskData) {
     let port: RoMessagePort | undefined;
+    // Restore `m` in the order the payload was written. `serializeTaskM` emits `top` and `global`
+    // first and writes any node it has already emitted as a `_circular_` back-reference, so
+    // replaying that order is what makes those back-references resolve: every one of them points
+    // at a node an earlier entry has already rebuilt. Restoring the other entries first (as this
+    // did) turned every reference into a subtree of `top`/`global` into a forward reference with
+    // nothing to resolve against, and it deserialized to invalid.
+    const nodeMap = new Map<string, Node>();
+    // `top`/`global` themselves are rebuilt by the caller, not by this pass — register the
+    // addresses they were serialized under so references to them resolve regardless of key order.
+    registerSerializedAddress(nodeMap, taskData.m?.global, sgRoot.mGlobal);
+    registerSerializedAddress(nodeMap, taskData.m?.top, node);
     if (taskData.m) {
         for (let [key, value] of Object.entries(taskData.m)) {
-            if (key === "global" || key === "top") {
-                // Ignore special fields to be set later
-                continue;
+            if (key === "global") {
+                restoreNodeFields(taskData.m.global, sgRoot.mGlobal, nodeMap);
+            } else if (key === "top") {
+                restoreNodeFields(taskData.m.top, node, nodeMap);
+            } else {
+                const brsValue = brsValueOf(value, undefined, nodeMap);
+                if (!port && brsValue instanceof RoMessagePort) {
+                    port = brsValue;
+                }
+                node.m.set(new BrsString(key), brsValue);
             }
-            const brsValue = brsValueOf(value);
-            if (!port && brsValue instanceof RoMessagePort) {
-                port = brsValue;
-            }
-            node.m.set(new BrsString(key), brsValue);
+        }
+        // Observers are attached in a second pass: they need the task's message port, and that
+        // only turns up while restoring `m`'s other entries.
+        if (taskData.m.global) {
+            restoreNodeObservers(interpreter, taskData.m.global, sgRoot.mGlobal, port);
+        }
+        if (taskData.m.top) {
+            restoreNodeObservers(interpreter, taskData.m.top, node, port);
         }
     }
-    if (taskData.m?.global) {
-        restoreNode(interpreter, taskData.m.global, sgRoot.mGlobal, port);
-    }
-    if (taskData.m?.top) {
-        restoreNode(interpreter, taskData.m.top, node, port);
+    // Deliver events that were already queued on the task's ports before launch (a device task
+    // sees them because its copied `m` references the same native port).
+    if (taskData.portEvents) {
+        replayPortNodeEvents(taskData.portEvents, node.m, node, sgRoot.mGlobal);
     }
 }
 
@@ -759,33 +814,55 @@ export function updateTypeDefHierarchy(typeDef: ComponentDefinition | undefined)
 }
 
 /**
- * Restores node fields from a serialized object.
- * Sets field values and reattaches field observers with message ports.
- * @param interpreter Interpreter instance for observer setup
+ * Restores a node's identity and field values from a serialized object.
+ *
+ * Split from observer restoration ({@link restoreNodeObservers}) so the fields can be rebuilt in
+ * payload order — the port the observers need is only discovered later.
  * @param source Serialized source object containing field values
  * @param node Node to restore fields into
- * @param port Optional message port for field observers
+ * @param nodeMap Optional address map used to resolve circular references to already-known nodes
  */
-function restoreNode(interpreter: Interpreter, source: any, node: Node, port?: RoMessagePort) {
-    const observedFields = source["_observed_"];
+function restoreNodeFields(source: any, node: Node, nodeMap?: Map<string, Node>) {
     node.setOwner(source["_owner_"] ?? sgRoot.threadId);
     node.setAddress(source["_address_"] ?? node.getAddress());
+    // Register under the address it was serialized with (which `setAddress` has just applied), so
+    // back-references to this node later in the payload resolve to it.
+    nodeMap?.set(node.getAddress(), node);
     for (let [key, value] of Object.entries(source)) {
         if (key.startsWith("_") && key.endsWith("_") && key.length > 2) {
             // Ignore serialization metadata fields
             continue;
         }
-        const brsValue = brsValueOf(value);
+        const brsValue = brsValueOf(value, undefined, nodeMap);
         if (brsValue instanceof Node) {
-            postMessage(`debug,[thread:${sgRoot.threadId}] Restoring Node ${node.nodeSubtype} field "${key}"`);
+            BrsDevice.stdout.write(
+                `debug,[thread:${sgRoot.threadId}] Restoring Node ${node.nodeSubtype} field "${key}"`
+            );
         }
         node.setValueSilent(key, brsValue);
-        if (port && Array.isArray(observedFields)) {
-            const observed = observedFields.find((field: ObservedField) => field.name === key);
-            if (observed) {
-                const infoFields = observed.info ? brsValueOf(observed.info) : undefined;
-                node.addObserver(interpreter, "unscoped", new BrsString(key), port, infoFields);
-            }
+    }
+}
+
+/**
+ * Reattaches the field observers a serialized node carried, binding them to the task's port.
+ * @param interpreter Interpreter instance for observer setup
+ * @param source Serialized source object containing the observed-field list
+ * @param node Node to attach the observers to
+ * @param port Message port for the field observers; no-op when the task has none
+ */
+function restoreNodeObservers(interpreter: Interpreter, source: any, node: Node, port?: RoMessagePort) {
+    const observedFields = source["_observed_"];
+    if (!port || !Array.isArray(observedFields)) {
+        return;
+    }
+    for (const key of Object.keys(source)) {
+        if (key.startsWith("_") && key.endsWith("_") && key.length > 2) {
+            continue;
+        }
+        const observed = observedFields.find((field: ObservedField) => field.name === key);
+        if (observed) {
+            const infoFields = observed.info ? brsValueOf(observed.info) : undefined;
+            node.addObserver(interpreter, "unscoped", new BrsString(key), port, infoFields);
         }
     }
 }
@@ -805,8 +882,18 @@ function addFields(interpreter: Interpreter, node: Node, typeDef: ComponentDefin
             continue;
         }
         if (fieldValue.alias?.includes(".")) {
-            if (!addAliases(fieldName, fieldValue.alias, node, typeDef, fieldValue.value)) {
-                return;
+            // An unresolvable alias target only warns (like a device): the remaining targets are
+            // still tried, and the fields declared after this one are still added.
+            addAliases(fieldName, fieldValue.alias, node, typeDef);
+            // Apply the XML default, mirroring the non-alias branch below. Alias targets share the
+            // parent field's Field instance, so this single write propagates the default to every
+            // target child (e.g. a `height` field defaulting to "42" and aliased to a child Poster's
+            // height, which would otherwise stay 0 and fall back to the bitmap's native size).
+            // An aliased field typically has no `type` attribute — its type comes from the shared
+            // target field — so coerce the value using the resolved field's type, not fieldValue.type.
+            const aliasField = node.resolveField(fieldName.toLowerCase());
+            if (fieldValue.value && aliasField) {
+                node.setValueSilent(fieldName, getBrsValueFromFieldType(aliasField.getType(), fieldValue.value));
             }
         } else {
             // resolveField materializes a ContentNode hidden metadata default so a component that
@@ -846,19 +933,18 @@ function addFields(interpreter: Interpreter, node: Node, typeDef: ComponentDefin
 
 /**
  * Add aliases for a field to a node based on the component definition.
+ *
+ * An unresolvable target (missing node or missing field) writes the device-style warning and is
+ * skipped — the remaining targets are still tried, so an alias whose FIRST target is bad still
+ * binds to any later valid ones (and vice versa). Matching a real device, a failed alias never
+ * aborts the component: fields declared after it must still be added, so callers must not treat
+ * this as fatal. When no target resolves at all, the field is simply not created.
  * @param fieldName The name of the field to alias.
  * @param fieldAlias The alias string specifying target nodes and fields.
  * @param node The node to which aliases are added.
  * @param typeDef The component definition containing field specifications.
- * @returns True if aliases were successfully added, false otherwise.
  */
-function addAliases(
-    fieldName: string,
-    fieldAlias: string,
-    node: Node,
-    typeDef: ComponentDefinition,
-    defaultValue?: string
-): boolean {
+function addAliases(fieldName: string, fieldAlias: string, node: Node, typeDef: ComponentDefinition) {
     // Parse comma-separated alias list (e.g., "child1.field1,child2.field2")
     const aliasParts = fieldAlias.split(",").map((s: string) => s.trim());
     const targets: FieldAliasTarget[] = [];
@@ -870,18 +956,11 @@ function addAliases(
         if (childNode instanceof Node && childField) {
             const field = childNode.resolveField(childField.toLowerCase());
             if (field) {
-                if (targets.length === 0) {
+                if (!sharedField) {
                     // Get first child field and type
                     sharedField = field;
                     fieldType = field.getType();
-                    // Propagate the alias field's declared default (e.g. `forceUpperCase` value="true"
-                    // alias="label.forceUpperCase") onto the shared target field, so the default
-                    // reaches the child at construction — matching the device, which forwards the
-                    // default, not only explicit sets.
-                    if (defaultValue !== undefined) {
-                        sharedField.setValue(getBrsValueFromFieldType(fieldType, defaultValue), false);
-                    }
-                } else if (sharedField && field.getType() === fieldType) {
+                } else if (field.getType() === fieldType) {
                     // Set siblings with the shared field
                     childNode.getNodeFields().set(childField.toLowerCase(), sharedField);
                 } else {
@@ -894,27 +973,17 @@ function addAliases(
                 msg += `-- Interface field alias failed: Node "${childName}" has no field named "${childField}"\n`;
                 msg += `-- Error found ${typeDef.xmlPath}`;
                 BrsDevice.stderr.write(msg);
-                if (sharedField) {
-                    break;
-                }
-                return false;
             }
         } else {
             let msg = `warning,Error creating XML component ${node.nodeSubtype}\n`;
             msg += `-- Interface field alias failed: No node named ${childName}\n`;
             msg += `-- Error found ${typeDef.xmlPath}`;
             BrsDevice.stderr.write(msg);
-            if (sharedField) {
-                break;
-            }
-            return false;
         }
     }
     if (targets.length > 0 && sharedField) {
         node.addNodeFieldAlias(fieldName, targets, sharedField);
-        return true;
     }
-    return false;
 }
 
 /**

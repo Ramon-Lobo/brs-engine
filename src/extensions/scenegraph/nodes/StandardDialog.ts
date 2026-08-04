@@ -19,14 +19,12 @@ import { sgRoot } from "../SGRoot";
 import { Node } from "./Node";
 import { Poster } from "./Poster";
 import { Rectangle } from "./Rectangle";
-import { RSGPalette } from "./RSGPalette";
 import { RoSGNode } from "../components/RoSGNode";
 import { StdDlgTitleArea } from "./StdDlgTitleArea";
 import { StdDlgContentArea } from "./StdDlgContentArea";
 import { StdDlgButtonArea } from "./StdDlgButtonArea";
 import { StdDlgSideCardArea } from "./StdDlgSideCardArea";
 import { colorFromPalette } from "./StdDlgItemBase";
-import { rotateTranslation } from "../SGUtil";
 
 /**
  * Base of the Standard Dialog Framework. Draws the 9-patch dialog background (palette-tinted) and
@@ -480,20 +478,39 @@ export class StandardDialog extends Group {
         );
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    /**
+     * Settles the dialog's own position before the render template derives a draw translation from
+     * it. `layoutStandardDialog` assigns THIS node's `translation` (it centers the dialog), so it has
+     * to run ahead of `getDrawTranslation` — otherwise a relayout frame would push the clippingRect
+     * at the dialog's previous position while it paints at the new one.
+     */
+    protected prepareRender(draw2D?: IfDraw2D) {
         if (!this.isVisible()) {
-            this.updateRenderTracking(true);
             return;
         }
         if (this.isDirty || this.pendingRelayout) {
             this.pendingRelayout = false;
             this.layoutStandardDialog();
         }
-        this.setNodeFocus(true);
-        const nodeTrans = this.getTranslation();
-        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+    }
+
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
+        if (!this.isVisible()) {
+            this.updateRenderTracking(true);
+            return;
+        }
+        // Claiming focus is a paint-side effect: a layout pass (a bounding-rect refresh that
+        // reaches the dialog) must not move focus.
+        if (this.isPaintPass(draw2D)) {
+            this.setNodeFocus(true);
+        }
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const size = this.getDimensions();
         const boundingRect: Rect = {
             x: drawTrans[0],
@@ -514,15 +531,12 @@ export class StandardDialog extends Group {
     }
 
     getPaletteColors() {
-        let palette = this.getValue("palette");
-        if (!(palette instanceof RSGPalette) && sgRoot.scene) {
-            palette = sgRoot.scene.getValue("palette");
-        }
-        if (palette instanceof RSGPalette) {
-            const colors = palette.getValue("colors");
-            if (colors instanceof RoAssociativeArray) {
-                return colors;
-            }
+        // Resolve the nearest RSGPalette by walking this dialog's ancestors (its own `palette`
+        // field, then up through any intermediate palette group to the Scene) — the shared Node
+        // resolution, rather than only checking self + Scene.
+        const colors = this.resolvePaletteColors();
+        if (colors) {
+            return colors;
         }
         // Fallback to default colors
         const defaultColors = {

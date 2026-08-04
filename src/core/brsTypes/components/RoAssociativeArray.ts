@@ -1,6 +1,6 @@
 import { BrsValue, ValueKind, BrsString, BrsBoolean, BrsInvalid } from "../BrsType";
 import { BrsComponent, BrsIterable } from "./BrsComponent";
-import { BrsType, isBoxable, isUnboxable, RoFunction } from "..";
+import { BrsType, isBoxable, isNumberKind, isUnboxable, RoFunction } from "..";
 import { isSceneGraphNode } from "../../extensions";
 import { Callable, StdlibArgument } from "../Callable";
 import { Interpreter } from "../../interpreter";
@@ -31,8 +31,13 @@ export class RoAssociativeArray extends BrsComponent implements BrsValue, BrsIte
         super("roAssociativeArray");
         this.modeCaseSensitive = cs;
         for (const member of elements) {
-            this.addChildRef(member.value);
-            this.set(member.name, member.value, true);
+            const element = member.value;
+            if (isBoxable(element) && isNumberKind(element.kind) && element.legacy) {
+                // set the literal flag of numeric values, when legacy was already set, to cover a Roku edge case for Type()
+                element.literal = true;
+            }
+            this.addChildRef(element);
+            this.set(member.name, element, true);
         }
         this.enumIndex = elements.length ? 0 : -1;
         const ifEnum = new IfEnum(this);
@@ -45,6 +50,7 @@ export class RoAssociativeArray extends BrsComponent implements BrsValue, BrsIte
                 this.doesExist,
                 this.append,
                 this.keys,
+                this.values,
                 this.items,
                 this.lookup,
                 this.lookupCI,
@@ -129,6 +135,14 @@ export class RoAssociativeArray extends BrsComponent implements BrsValue, BrsIte
         return new RoAssociativeArray(copiedElements, this.modeCaseSensitive);
     }
 
+    boxLiterals() {
+        for (const [key, value] of this.elements) {
+            if (isBoxable(value) && !(value instanceof Callable)) {
+                this.elements.set(key, value.box());
+            }
+        }
+    }
+
     get(index: BrsType, isCaseSensitive = false) {
         if (isUnboxable(index)) {
             index = index.unbox();
@@ -137,18 +151,12 @@ export class RoAssociativeArray extends BrsComponent implements BrsValue, BrsIte
             throw new Error("Associative array indexes must be strings");
         }
 
-        // TODO: this works for now, in that a property with the same name as a method essentially
-        // overwrites the method. The only reason this doesn't work is that getting a method from an
-        // associative array and _not_ calling it returns `invalid`, but calling it returns the
-        // function itself. I'm not entirely sure why yet, but it's gotta have something to do with
-        // how methods are implemented within RBI.
-        //
-        // Are they stored separately from elements, like they are here? Or does
-        // `Interpreter#visitCall` need to check for `invalid` in its callable, then try to find a
-        // method with the desired name separately? That last bit would work but it's pretty gross.
-        // That'd allow roArrays to have methods with the methods not accessible via `arr["count"]`.
-        // Same with RoAssociativeArrays I guess.
-        return this.findElement(index.value, isCaseSensitive) || this.getMethod(index.value) || BrsInvalid.Instance;
+        // A member read only sees stored elements — on Roku `aa.items` is invalid when no such
+        // key exists, even though Items() is an interface method (apps rely on that to probe
+        // parsed JSON: `if invalid <> data.items`). Interface methods are resolvable only at a
+        // call site: the interpreter's DottedGet/IndexedGet visitors fall back to getMethod()
+        // when this get() yields invalid for a call's callee.
+        return this.findElement(index.value, isCaseSensitive) ?? BrsInvalid.Instance;
     }
 
     set(index: BrsType, value: BrsType, isCaseSensitive = false) {
@@ -162,12 +170,20 @@ export class RoAssociativeArray extends BrsComponent implements BrsValue, BrsIte
         let oldKey = this.findElementKey(index.value);
         this.addChildRef(value);
         if (oldKey) this.removeChildRef(this.elements.get(oldKey));
+        let indexValue = isCaseSensitive ? index.value : index.value.toLowerCase();
         if (!this.modeCaseSensitive && oldKey) {
+            if (oldKey === indexValue) {
+                // Replace in place: keep the key's position in the backing Map. Roku does not
+                // reorder an AA when an existing key's value is replaced — a delete + re-insert
+                // here moved the key to the end, which made a `for each` that assigns to existing
+                // keys of the same AA skip entries (and visit others twice).
+                this.elements.set(oldKey, value);
+                return BrsInvalid.Instance;
+            }
+            // Different casing: re-case the stored key to the latest write (matching Roku).
             this.elements.delete(oldKey);
             this.keyMap.set(oldKey.toLowerCase(), new Set()); // clear key set cuz in insensitive mode we should have 1 key in set
         }
-
-        let indexValue = isCaseSensitive ? index.value : index.value.toLowerCase();
         this.elements.set(indexValue, value);
 
         let lkey = index.value.toLowerCase();
@@ -357,6 +373,17 @@ export class RoAssociativeArray extends BrsComponent implements BrsValue, BrsIte
         },
         impl: (_: Interpreter) => {
             return new RoArray(this.getElements());
+        },
+    });
+
+    /** Returns an array of the associative array's values, ordered by their keys. */
+    private readonly values = new Callable("values", {
+        signature: {
+            args: [],
+            returns: ValueKind.Object,
+        },
+        impl: (_: Interpreter) => {
+            return new RoArray(this.getElements().map((key: BrsString) => this.get(key)));
         },
     });
 

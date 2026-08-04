@@ -42,7 +42,9 @@ export interface DeviceInfo {
     startTime: number;
     audioVolume: number;
     audioLanguage: SupportedLanguage;
+    autoPlayEnabled: boolean;
     maxFps: number;
+    minVideoBufferMs?: number;
     tmpVolSize: number;
     cacheFSVolSize: number;
     logLevel: LogLevel;
@@ -55,6 +57,7 @@ export interface DeviceInfo {
     appList?: AppData[];
     entryPoint?: boolean;
     debugOnCrash?: boolean;
+    logRendezvous?: boolean;
     corsProxy?: string;
     extensions?: Map<SupportedExtension, string>;
 }
@@ -148,7 +151,9 @@ export const DefaultDeviceInfo: DeviceInfo = {
     startTime: Date.now(),
     audioVolume: 50, // Defines the default volume level for system sounds - valid: (0-100)
     audioLanguage: "en",
+    autoPlayEnabled: true, // Autoplay device setting - enabled by default, as on a real Roku device
     maxFps: 60,
+    minVideoBufferMs: 700, // Simulated minimum buffering floor (ms) before playback starts; only affects instant/cached sources
     tmpVolSize: 32 * 1024 * 1024, // 32 MB
     cacheFSVolSize: 32 * 1024 * 1024, // 32 MB
     logLevel: LogLevel.Warning,
@@ -255,6 +260,45 @@ export function isExtensionInfo(value: any): value is ExtensionInfo {
 }
 
 /**
+ * Frame (screen pixels) data wrapper used to send ImageData across Node worker_threads.
+ * node-canvas `ImageData` exposes width/height as prototype getters, which are lost by the
+ * structured clone, so the worker flattens frames into this plain shape and the host revives
+ * them into a real ImageData instance.
+ */
+export type FrameData = {
+    frameData: Uint8ClampedArray;
+    frameWidth: number;
+    frameHeight: number;
+};
+
+/** Type guard to check if a value is a FrameData object.
+ * @param value the value to check
+ * @returns true if the value is a FrameData object, false otherwise
+ */
+export function isFrameData(value: any): value is FrameData {
+    return (
+        value &&
+        typeof value === "object" &&
+        isTypeOf(value.frameData, "Uint8ClampedArray") &&
+        typeof value.frameWidth === "number" &&
+        typeof value.frameHeight === "number"
+    );
+}
+
+/**
+ * Realm-safe type-brand check: `instanceof` fails for objects deserialized from another JS
+ * realm (e.g. worker_threads messages received while running under a VM-sandboxed test
+ * runner pool, such as Vitest's `vmThreads`), so
+ * built-in kinds are matched by their `Object.prototype.toString` brand instead.
+ * @param value the value to check
+ * @param brand the built-in type name (e.g. "SharedArrayBuffer", "Map", "Uint8ClampedArray")
+ * @returns true if the value is of the given built-in kind, false otherwise
+ */
+export function isTypeOf(value: any, brand: string): boolean {
+    return Object.prototype.toString.call(value) === `[object ${brand}]`;
+}
+
+/**
  * Registry Data Interface
  */
 export interface RegistryData {
@@ -272,7 +316,7 @@ export function isRegistryData(value: any): value is RegistryData {
     return (
         value &&
         typeof value === "object" &&
-        value.current instanceof Map &&
+        isTypeOf(value.current, "Map") &&
         Array.isArray(value.removed) &&
         typeof value.isDirty === "boolean"
     );
@@ -319,6 +363,37 @@ export function isGraphicsData(value: any): value is { graphics: GraphicsData } 
 
 // Default maximum texture memory (bytes) reported by the graphics debug data.
 export const MaxTextureMemory = 100000000;
+
+/**
+ * A single cross-thread SceneGraph rendezvous, as reported by ECP `query/sgrendezvous`. Collected at
+ * the same instrumentation points as the `logrendezvous` console trace, but only when ECP tracking
+ * (`sgrendezvous/track`) is active.
+ */
+export interface RendezvousEvent {
+    id: number; // Monotonic id, shared with the `logrendezvous` console trace sequence
+    // Rendezvous start/end, monotonic ms (`sgClock.perfNow()` semantics) — device-observed `start-tm`/
+    // `end-tm` are a small-magnitude uptime-like clock, not epoch time, so this is NOT `Date.now()`.
+    startTm: number;
+    endTm: number;
+    line: number; // Source line of the call site that triggered the rendezvous
+    file: string; // Source file (pkg:/...) of the call site
+}
+
+/**
+ * Type guard to check if a value is a rendezvous debug message ({ rendezvous: RendezvousEvent }).
+ * @param value the value to check
+ * @returns true if the value wraps a RendezvousEvent object, false otherwise
+ */
+export function isRendezvousEvent(value: any): value is { rendezvous: RendezvousEvent } {
+    return (
+        value &&
+        typeof value === "object" &&
+        value.rendezvous &&
+        typeof value.rendezvous === "object" &&
+        typeof value.rendezvous.id === "number" &&
+        typeof value.rendezvous.file === "string"
+    );
+}
 
 /* Execution Payload Interfaces
  *
@@ -415,6 +490,8 @@ export type TaskData = {
     tmp?: SharedArrayBuffer;
     cacheFS?: SharedArrayBuffer;
     m?: any;
+    /** roSGNodeEvents queued on ports held by the task's `m` before launch, keyed by m entry name. */
+    portEvents?: Record<string, any[]>;
     render?: string;
 };
 
@@ -429,7 +506,7 @@ export function isTaskData(value: any): value is TaskData {
         typeof value.id === "number" &&
         typeof value.name === "string" &&
         Object.values(TaskState).includes(value.state) &&
-        (value.buffer instanceof SharedArrayBuffer || value.buffer === undefined) &&
+        (isTypeOf(value.buffer, "SharedArrayBuffer") || value.buffer === undefined) &&
         (typeof value.m === "object" || value.m === undefined) &&
         (typeof value.render === "string" || value.render === undefined)
     );
@@ -566,7 +643,7 @@ export function isAppData(value: any): value is AppData {
         (typeof value.password === "string" || value.password === undefined) &&
         (typeof value.exitReason === "string" || value.exitReason === undefined) &&
         (typeof value.exitTime === "number" || value.exitTime === undefined) &&
-        (value.params instanceof Map || value.params === undefined) &&
+        (isTypeOf(value.params, "Map") || value.params === undefined) &&
         (typeof value.running === "boolean" || value.running === undefined)
     );
 }
@@ -667,8 +744,12 @@ export enum DataType {
     MUHS, // Memory Used Heap Size
     MHSL, // Memory Heap Size Limit
     MBWD, // Measured Bandwidth
+    RDZ, // Rendezvous Logging (0/1)
     CEC, // Consumer Electronics Control
     HDMI, // HDMI Status
+    RHB, // Render Thread Heartbeat (statement counter, render thread writes only)
+    RDN, // Rendezvous sequence Number (monotonic id shared by all threads for logRendezvous tracing)
+    RDT, // Rendezvous Data Tracking (0/1), ECP `sgrendezvous` track/untrack state
     // Key Buffer starts here: KeyBufferSize * KeyArraySpots
     RID, // Remote Id
     KEY, // Key Code
@@ -687,8 +768,10 @@ export const RegistryMaxSize = 64 * 1024;
 export const KeyBufferSize = 5;
 export const KeyArraySpots = 3;
 
-// Index where the data buffer starts and the size of the data buffer
-export const DataBufferIndex = DataType.HDMI + KeyBufferSize * KeyArraySpots;
+// Index where the data buffer starts and the size of the data buffer.
+// Derived from the first key slot so the data buffer always begins right after the key buffer,
+// no matter how many status slots are added above it.
+export const DataBufferIndex = DataType.RID + KeyBufferSize * KeyArraySpots;
 export const DataBufferSize = 1024;
 
 // Remote control type
@@ -978,15 +1061,21 @@ export function getRokuOSVersion(firmware: string) {
 
 /**
  * Returns the current UTC timestamp in Roku beacon date format.
- * @returns Formatted date string (MM-DD HH:MM:SS.ms)
+ *
+ * `Intl.DateTimeFormat`'s `2-digit` style only zero-pads reliably when the field is formatted
+ * alongside a full date/time context; requested in isolation (as each component is here, so UTC
+ * conversion can be applied per-field) it silently drops the leading zero below 10 — so each part
+ * is padded manually instead of trusting the formatter's `2-digit` option.
+ * @returns Formatted date string (MM-DD HH:MM:SS.mmm)
  */
 export function getNow(): string {
     let d = new Date();
-    let mo = new Intl.DateTimeFormat("en-GB", { month: "2-digit", timeZone: "UTC" }).format(d);
-    let da = new Intl.DateTimeFormat("en-GB", { day: "2-digit", timeZone: "UTC" }).format(d);
-    let hr = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", timeZone: "UTC" }).format(d);
-    let mn = new Intl.DateTimeFormat("en-GB", { minute: "2-digit", timeZone: "UTC" }).format(d);
-    let se = new Intl.DateTimeFormat("en-GB", { second: "2-digit", timeZone: "UTC" }).format(d);
-    let ms = d.getMilliseconds();
+    let pad = (value: string | number, width: number = 2) => String(value).padStart(width, "0");
+    let mo = pad(new Intl.DateTimeFormat("en-GB", { month: "2-digit", timeZone: "UTC" }).format(d));
+    let da = pad(new Intl.DateTimeFormat("en-GB", { day: "2-digit", timeZone: "UTC" }).format(d));
+    let hr = pad(new Intl.DateTimeFormat("en-GB", { hour: "2-digit", timeZone: "UTC" }).format(d));
+    let mn = pad(new Intl.DateTimeFormat("en-GB", { minute: "2-digit", timeZone: "UTC" }).format(d));
+    let se = pad(new Intl.DateTimeFormat("en-GB", { second: "2-digit", timeZone: "UTC" }).format(d));
+    let ms = pad(d.getMilliseconds(), 3);
     return `${mo}-${da} ${hr}:${mn}:${se}.${ms}`;
 }

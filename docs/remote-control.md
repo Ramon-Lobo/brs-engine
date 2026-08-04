@@ -4,7 +4,7 @@ The `brs-engine` simulates the Roku remote control, offering customizable mappin
 
 If you want to create your own control simulation, such as a touch screen control, you can use the [Engine API](./engine-api.md) methods `sendKeyDown`, `sendKeyUp`, and `sendKeyPress`.
 
-The NodeJS `brs.ecp.js` library supports sending commands via the [Roku ECP API](https://developer.roku.com/docs/developer-program/dev-tools/external-control-api.md), which can also be used to simulate remote control for applications [running under the CLI](./run-as-cli.md).
+When [running under the CLI](./run-as-cli.md) in a terminal (TTY), the keyboard acts as the remote control directly on the main thread while the app runs on a worker thread — see the [keyboard table](./run-as-cli.md#controlling-the-app) in the CLI guide. The NodeJS `brs.ecp.js` library additionally supports sending commands via the [Roku ECP API](https://developer.roku.com/dev/docs/external-control-api) from other devices on the network (`--ecp` option).
 
 ## Keyboard and Game Pad Control Reference
 
@@ -24,6 +24,7 @@ The default mapping of the keyboard and game pads to Roku remote control is desc
 | Ctrl+A      |    10      |     A        | A game button.                                                        |
 | Ctrl+Z      |    11      |     B        | B game button.                                                        |
 | F10         |    17      | Volume Mute  | Button to toggle the simulator audio mute on/off.                     |
+| Letters & digits |  n/a  | Text input   | Any other printable key is sent as a literal `lit_<char>` key, used by keyboard dialogs. |
 
 **Note:** There are mappings not listed above, specific for MacOS or Windows, please look at the file [`src/api/control.ts`](../src/api/control.ts) for details.
 

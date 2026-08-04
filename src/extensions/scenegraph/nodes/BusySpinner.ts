@@ -1,6 +1,7 @@
 import { AAMember, Interpreter, BrsString, BrsType, RoArray, Float, IfDraw2D, Rect } from "brs-engine";
+import { sgClock } from "../SGClock";
+import { sgRoot } from "../SGRoot";
 import { FieldKind, FieldModel } from "../SGTypes";
-import { rotateTranslation } from "../SGUtil";
 import { SGNodeType } from ".";
 import { Group } from "./Group";
 import { Poster } from "./Poster";
@@ -39,7 +40,7 @@ export class BusySpinner extends Group {
             const control = value.toString();
             if (control === "start") {
                 this.active = true;
-                this.lastRenderTime = Date.now();
+                this.lastRenderTime = sgClock.now();
             } else if (control === "stop") {
                 this.active = false;
             } else {
@@ -84,25 +85,31 @@ export class BusySpinner extends Group {
         }
     }
 
-    renderNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D?: IfDraw2D) {
+    protected renderNodeContent(
+        interpreter: Interpreter,
+        origin: number[],
+        angle: number,
+        opacity: number,
+        draw2D?: IfDraw2D
+    ) {
         if (!this.isVisible()) {
             this.updateRenderTracking(true);
             return;
         }
-        const nodeTrans = this.getTranslation();
-        const drawTrans = angle === 0 ? nodeTrans.slice() : rotateTranslation(nodeTrans, angle);
-        drawTrans[0] += origin[0];
-        drawTrans[1] += origin[1];
+        const drawTrans = this.getDrawTranslation(origin, angle);
         const rotation = angle + this.getRotation();
         opacity = opacity * this.getOpacity();
         if (this.isDirty) {
             this.updateChildren();
         }
-        if (this.active) {
+        // Advance the spin only on a paint pass: a layout pass (a bounding-rect refresh) must be
+        // pure and clock-free — it renders the poster at its stored rotation. Consuming the time
+        // delta here would also make measurement frequency change the spin speed.
+        if (this.active && this.isPaintPass(draw2D)) {
             if (this.lastRenderTime === 0) {
-                this.lastRenderTime = Date.now();
+                this.lastRenderTime = sgClock.now();
             }
-            const now = Date.now();
+            const now = sgClock.now();
             const spinInterval = this.getValueJS("spinInterval") as number;
             const clockwise = this.getValueJS("clockwise") as boolean;
             const direction = clockwise ? -1 : 1;
@@ -111,7 +118,10 @@ export class BusySpinner extends Group {
             if (rotationChange !== 0) {
                 this.currentRotation += direction * rotationChange;
                 const spin = this.currentRotation + rotation;
-                this.poster.setValue("rotation", new Float(spin));
+                // Silent write + explicit dirty: the internal poster's rotation has no app
+                // observers to notify, but the spinner still needs the next frame drawn.
+                this.poster.setValueSilent("rotation", new Float(spin));
+                sgRoot.makeDirty();
                 this.lastRenderTime = now;
             }
         }

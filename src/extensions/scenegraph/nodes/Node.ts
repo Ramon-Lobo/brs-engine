@@ -52,8 +52,24 @@ import { toAssociativeArray, jsValueOf, fromSGNode } from "../factory/Serializer
 import { sgRoot } from "../SGRoot";
 import { SGNodeType } from ".";
 import { ComponentDefinition } from "../parser/ComponentDefinition";
+import { convertHexColor } from "../SGUtil";
 
 type ChangeOperation = "none" | "insert" | "add" | "remove" | "set" | "clear" | "move" | "setall" | "modify";
+
+/** A `focusedChild` write held back until its focus transaction is fully committed. */
+type StagedFocus = { node: Node; field: Field };
+
+/** Reads the RSGPalette `colors` set held directly on `node` (an RSGPalette in its `palette` field). */
+function paletteColorsOf(node: Node): RoAssociativeArray | undefined {
+    const palette = node.getValue("palette");
+    if (palette instanceof Node) {
+        const colors = palette.getValue("colors");
+        if (colors instanceof RoAssociativeArray) {
+            return colors;
+        }
+    }
+    return undefined;
+}
 
 /**
  * Base implementation for a SceneGraph node used by custom Roku components.
@@ -71,6 +87,17 @@ export class Node extends RoSGNode implements BrsValue {
     private static readonly hiddenSpecCache = new WeakMap<Function, Map<string, FieldModel>>();
     /** Reference to this instance's class spec (see hiddenSpecCache). */
     private hiddenFieldSpec?: Map<string, FieldModel>;
+    /**
+     * Stack of nodes whose `focusedChild` observers are currently dispatching, innermost last.
+     * Read by `isFocusRequestDropped` to tell a focus-gain notification (whose observer may move
+     * focus onward) from a focus-loss one (whose focus requests a Roku ignores).
+     */
+    private static readonly focusNotifyOwners: Node[] = [];
+    /**
+     * Set while a focus transaction stages its `focusedChild` writes: `setValue` applies the value
+     * but routes the notification here instead of dispatching it — see `stageFocusedChild`.
+     */
+    private static focusStagingSink: StagedFocus[] | undefined;
     /** Field registry keyed by lowercase name. */
     protected readonly fields: Map<string, Field>;
     /** Alias definitions pointing to fields on child nodes. */
@@ -93,12 +120,45 @@ export class Node extends RoSGNode implements BrsValue {
     protected parent: Node | BrsInvalid;
     /** Thread identifier that owns the node instance. */
     protected owner: number;
+    /**
+     * Marks this instance as an address-only stand-in for a node owned by another thread: it was
+     * rebuilt from a reference carrying no fields, so its field list is *incomplete* and a miss
+     * means "not mirrored yet", not "does not exist". Reads of an unknown field therefore have to
+     * rendezvous to the owner instead of answering `invalid` locally (see `get`).
+     */
+    protected remoteProxy: boolean = false;
     /** Sync domain used for remote field and method requests. */
     protected syncType: SyncType;
     /** Hex-like identifier exposed via introspection APIs. */
     protected address: string;
     /** Flags whether structural or field state changed since last render. */
     changed: boolean = false;
+    /**
+     * True when this node or anything below it changed since its subtree last completed a layout
+     * pass. Set by `makeDirty()` (the funnel for every field write and child-list mutation) and
+     * propagated UP the parent chain, so a pruned layout refresh (`sgRoot.pruneLayout`) can skip
+     * settled subtrees. Cleared at the START of a node's layout pass — BrightScript running
+     * inside the pass (an item component's init(), a field observer) re-marks it and that mark
+     * must survive for the next refresh. Starts true so everything lays out on first pass.
+     */
+    subtreeStale: boolean = true;
+    /**
+     * True when this node or anything below it was WRITTEN since its subtree last completed any
+     * layout pass — a full one or a scoped mid-render measurement. Set alongside `subtreeStale` by
+     * `markSubtreeStale()`, but cleared independently, because the two answer different questions:
+     *
+     * - `subtreeStale` — "may a pruned full refresh skip this subtree?" A scoped measurement at
+     *   origin [0,0] must LEAVE it set (`markSubtreeStaleDeep`), since it clobbered the subtree's
+     *   `rectToScene` with origin-less values that only a full refresh can re-establish.
+     * - `measureStale` — "would re-measuring this subtree produce a different size?" Sizes are
+     *   translation-invariant, so the scoped measurement fully answers it and CLEARS this flag.
+     *
+     * Sharing one flag forced a bad trade: keyed on `subtreeStale`, every repeat mid-render query
+     * re-rendered the subtree (the deep mark it just set made itself look stale again); keyed on a
+     * degenerate rect alone, a repeat query returned a stale cached size after the app changed
+     * something. This flag lets a changed subtree re-measure while an unchanged repeat hits the cache.
+     */
+    measureStale: boolean = true;
 
     /** Node bounds in local coordinates. */
     rectLocal: Rect = { x: 0, y: 0, width: 0, height: 0 };
@@ -300,6 +360,25 @@ export class Node extends RoSGNode implements BrsValue {
     }
 
     /**
+     * Whether this node's children should be included in cross-thread serialization.
+     *
+     * Most nodes serialize their children so a Task thread sees the full subtree. But a
+     * built-in composite node (e.g. Video) builds its visible children internally in its
+     * constructor and keeps private references to them (`this.trickPlayBar`, the spinner,
+     * the header labels, …), updating those references every frame (`showUI`). If such a
+     * node's children are serialized, a Task's reconciliation (`updateSGNode`) replaces
+     * the render-thread children with fresh deserialized copies while the private field
+     * references keep pointing at the originals — so per-frame updates land on nodes that
+     * are no longer in the render tree and the overlay silently stops appearing. These
+     * nodes override this to opt out; their children never need to cross a thread because a
+     * Task never renders them.
+     * @returns True when children participate in cross-thread serialization.
+     */
+    serializesChildren(): boolean {
+        return true;
+    }
+
+    /**
      * Looks up a field or method by name, mimicking BrightScript associative-array semantics.
      * @param index Field or method name as a BrightScript string value.
      * @throws Error when an unsupported index type is provided.
@@ -311,16 +390,26 @@ export class Node extends RoSGNode implements BrsValue {
         }
         const key = index.toString().toLowerCase();
         if (this.shouldRendezvous()) {
-            if (this.hasNodeField(key)) {
-                const task = sgRoot.getCurrentThreadTask();
-                // By default every read of a render-owned field rendezvouses, matching real Roku
-                // behavior ("each dot represents a distinct rendezvous"). The freshFields read-cache
-                // is only consulted in the opt-in `fastFieldReads` performance mode.
-                if (task?.active && !(sgRoot.fastFieldReads && this.consumeFreshField(key))) {
-                    task.requestFieldValue(this.syncType, this.address, key);
-                }
-            } else {
+            // An address-only proxy knows none of the owner's fields, so an unknown key there means
+            // "not mirrored yet" and must still rendezvous — otherwise every field the owner added
+            // at runtime (addField/addFields, or a subclass's own XML interface) reads back invalid
+            // without ever asking the owner. Methods resolve locally either way.
+            const mirrored = this.hasNodeField(key);
+            if (!mirrored && !this.remoteProxy) {
                 return this.getMethod(key) || BrsInvalid.Instance;
+            }
+            if (!mirrored) {
+                const method = this.getMethod(key);
+                if (method) {
+                    return method;
+                }
+            }
+            const task = sgRoot.getCurrentThreadTask();
+            // By default every read of a render-owned field rendezvouses, matching real Roku
+            // behavior ("each dot represents a distinct rendezvous"). The freshFields read-cache
+            // is only consulted in the opt-in `fastFieldReads` performance mode.
+            if (task?.active && !(sgRoot.fastFieldReads && this.consumeFreshField(key))) {
+                task.requestFieldValue(this.syncType, this.address, key);
             }
         }
         const field = this.resolveField(key);
@@ -386,7 +475,13 @@ export class Node extends RoSGNode implements BrsValue {
                     errorMsg = `BRIGHTSCRIPT: ERROR: roSGNode.Set: Tried to set nonexistent field "${index}" of a "${this.nodeSubtype}" node:`;
                 }
             } else if (field.canAcceptValue(value)) {
-                this.notified = field.setValue(value, true);
+                // A `focusedChild` write made while a focus transaction is staging is applied now
+                // but notified later, once the whole chain is committed — see stageFocusedChild.
+                const sink = mapKey === "focusedchild" ? Node.focusStagingSink : undefined;
+                this.notified = field.setValue(value, sink === undefined);
+                if (sink) {
+                    sink.push({ node: this, field });
+                }
                 this.fields.set(mapKey, field);
                 const alias = this.aliases.get(mapKey);
                 if (alias) {
@@ -412,6 +507,7 @@ export class Node extends RoSGNode implements BrsValue {
             BrsDevice.stderr.write(`warning,${errorMsg} ${this.location || "(internal)"}`);
         }
         this.markFieldFresh(mapKey);
+        field?.setContainer(this);
         if (field && sync && this.syncType !== "task") {
             this.rendezvousSet(mapKey, field);
         }
@@ -441,6 +537,7 @@ export class Node extends RoSGNode implements BrsValue {
         }
         if (field) {
             this.fields.set(mapKey, field);
+            field.setContainer(this);
             this.makeDirty();
         }
         this.markFieldFresh(mapKey);
@@ -613,13 +710,19 @@ export class Node extends RoSGNode implements BrsValue {
      * @param type Roku field type string.
      * @param alwaysNotify Whether observers should always fire for the field.
      * @param sync Whether the field update should be synchronized with other threads.
+     * @param silent When true the field is created without notifying observers or rendezvousing
+     *        (used to mirror a field already added authoritatively on the owning thread).
      */
-    addNodeField(fieldName: string, type: string, alwaysNotify: boolean, sync?: boolean) {
+    addNodeField(fieldName: string, type: string, alwaysNotify: boolean, sync?: boolean, silent = false) {
         let defaultValue = getBrsValueFromFieldType(type);
         let fieldKind = FieldKind.fromString(type);
 
         if (defaultValue !== Uninitialized.Instance && !this.hasNodeField(fieldName.toLowerCase())) {
-            this.setValue(fieldName, defaultValue, alwaysNotify, fieldKind, sync);
+            if (silent) {
+                this.setValueSilent(fieldName, defaultValue, undefined, fieldKind);
+            } else {
+                this.setValue(fieldName, defaultValue, alwaysNotify, fieldKind, sync);
+            }
             this.makeDirty();
         }
     }
@@ -659,11 +762,17 @@ export class Node extends RoSGNode implements BrsValue {
      * Sets one or more fields from an associative array.
      * @param fieldsToSet Data source.
      * @param addFields If true, missing fields are created.
+     * @param silent When true the fields are set without notifying observers or rendezvousing
+     *        (used to mirror fields already added authoritatively on the owning thread).
      */
-    protected setNodeFields(fieldsToSet: RoAssociativeArray, addFields: boolean) {
+    protected setNodeFields(fieldsToSet: RoAssociativeArray, addFields: boolean, silent = false) {
         for (const [key, value] of fieldsToSet.elements) {
             if (addFields || (!addFields && this.hasNodeField(key.toLowerCase()))) {
-                this.setValue(key, value, false);
+                if (silent) {
+                    this.setValueSilent(key, value);
+                } else {
+                    this.setValue(key, value, false);
+                }
                 this.makeDirty();
             }
         }
@@ -737,6 +846,64 @@ export class Node extends RoSGNode implements BrsValue {
     }
 
     /**
+     * Resolves the RSGPalette color set that themes this node.
+     *
+     * On Roku, palette colors cascade down the scene graph: a node is themed by the nearest
+     * `palette` (an RSGPalette node holding a `colors` assocarray) found by walking up from itself
+     * through its ancestors — its own `palette` field first, then each parent up to the Scene. This
+     * is the resolution documented for the DynamicKeyGrid, but it is a general capability every node
+     * shares (Scene, StandardDialog, the dynamic keyboards, …). Returns the matched `colors`
+     * assocarray, or `undefined` when no node in the chain sets a palette.
+     */
+    resolvePaletteColors(): RoAssociativeArray | undefined {
+        // Check this node first, then walk up through its ancestors.
+        const own = paletteColorsOf(this);
+        if (own) {
+            return own;
+        }
+        let ancestor: Node | BrsInvalid = this.getNodeParent();
+        while (ancestor instanceof Node) {
+            const colors = paletteColorsOf(ancestor);
+            if (colors) {
+                return colors;
+            }
+            ancestor = ancestor.getNodeParent();
+        }
+        return undefined;
+    }
+
+    /**
+     * Resolves a single named palette color (as an `0xRRGGBBAA` integer) for this node, returning
+     * `fallback` when no ancestor palette is set or it lacks the named color. Palette color values
+     * may be stored as integers or as hex-string colors (e.g. "0xRRGGBBAA" / "#RRGGBBAA"); both are
+     * accepted so an app-supplied RSGPalette works regardless of how its colors were written.
+     */
+    resolvePaletteColor(name: string, fallback: number): number {
+        const colors = this.resolvePaletteColors();
+        if (colors) {
+            const color = colors.get(new BrsString(name));
+            if (isBrsString(color)) {
+                // convertHexColor returns a signed 32-bit int, so a high-alpha color like
+                // "0xE13100FF" parses negative, and opaque white collides with its -1 invalid
+                // sentinel — validate the hex digits here instead of gating on the parsed sign.
+                const hex = color
+                    .getValue()
+                    .trim()
+                    .replace(/^(#|0x|&h)/i, "");
+                if (/^[0-9a-f]{1,8}$/i.test(hex)) {
+                    return convertHexColor(hex);
+                }
+            } else {
+                const value = jsValueOf(color);
+                if (typeof value === "number") {
+                    return value;
+                }
+            }
+        }
+        return fallback;
+    }
+
+    /**
      * Assigns a new parent reference.
      * @param parent Node that is adopting this node.
      */
@@ -769,11 +936,15 @@ export class Node extends RoSGNode implements BrsValue {
             return;
         }
         const chain = this.createPath(focused); // [root, ..., focused]
+        // Repairing the chain is a focus transaction like any other: stage every write, then notify,
+        // so an observer never reads a half-repaired chain (see stageFocusedChild).
+        const staged: StagedFocus[] = [];
         for (let i = 0; i < chain.length - 1; i++) {
             if (chain[i].getValue("focusedchild") !== chain[i + 1]) {
-                chain[i].setValue("focusedchild", chain[i + 1], false);
+                chain[i].stageFocusedChild(chain[i + 1], staged);
             }
         }
+        Node.notifyStagedFocus(staged, true);
     }
 
     /**
@@ -823,6 +994,49 @@ export class Node extends RoSGNode implements BrsValue {
     }
 
     /**
+     * Layout entry point: computes bounding rects for this node's subtree without drawing,
+     * advancing time-based state, or producing any other side effect. Must be idempotent —
+     * calling it twice with the same inputs and an unchanged tree yields identical rects.
+     * Default implementation runs `renderNode` with no draw target (today's measurement pass)
+     * under a `layout` render-pass context; node types with time-based render state gate that
+     * state on `isPaintPass`. See `docs/scenegraph-layout-passes.md`.
+     */
+    layoutNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number) {
+        const previousPass = sgRoot.renderPass;
+        sgRoot.renderPass = "layout";
+        try {
+            this.renderNode(interpreter, origin, angle, opacity);
+        } finally {
+            sgRoot.renderPass = previousPass;
+        }
+    }
+
+    /**
+     * Paint entry point: the per-frame render. Recomputes layout inline (as `renderNode` always
+     * has), advances time-based state (spinner rotation, marquee scroll, cursor blink, seek
+     * repeat), and draws through the required `IfDraw2D`.
+     */
+    paintNode(interpreter: Interpreter, origin: number[], angle: number, opacity: number, draw2D: IfDraw2D) {
+        const previousPass = sgRoot.renderPass;
+        sgRoot.renderPass = "paint";
+        try {
+            this.renderNode(interpreter, origin, angle, opacity, draw2D);
+        } finally {
+            sgRoot.renderPass = previousPass;
+        }
+    }
+
+    /**
+     * Whether the current traversal may advance time-based state and emit render side effects.
+     * True on paint passes and on direct `renderNode` calls with a draw target; false inside
+     * `layoutNode` traversals. The `draw2D` check keeps direct `renderNode(..., draw2D)` calls
+     * (external node registrations, tests) behaving as paint regardless of context.
+     */
+    protected isPaintPass(draw2D?: IfDraw2D): boolean {
+        return draw2D !== undefined || sgRoot.renderPass === "paint";
+    }
+
+    /**
      * Iterates through child nodes, invoking their render methods in order.
      * @param interpreter Active interpreter.
      * @param origin Parent-space translation.
@@ -841,21 +1055,116 @@ export class Node extends RoSGNode implements BrsValue {
     }
 
     /**
+     * Refreshes layout by rendering the whole tree from the root, guarding against re-entrant
+     * renders. Mark this refresh as an active render: BrightScript that runs inside it (an item
+     * component's init() or a field observer measuring a Label) must not start another full-tree
+     * refresh, or the passes recurse until the JS stack overflows — the same guard RoSGScreen
+     * applies around frame renders, extended to refreshes initiated by a bounding-rect query.
+     * Nested queries return the rects this pass computes. Callers must first check `!sgRoot.rendering`.
+     */
+    private refreshLayoutFromRoot(interpreter: Interpreter) {
+        const root = this.createPath()[0];
+        sgRoot.rendering = true;
+        try {
+            // Prune settled subtrees (sound because layout passes are pure). Only this
+            // full-tree refresh prunes — scoped subtree measurements never do.
+            sgRoot.pruneLayout = !sgRoot.pruneDisabled;
+            try {
+                root.layoutNode(interpreter, [0, 0], 0, 1);
+            } finally {
+                sgRoot.pruneLayout = false;
+            }
+        } finally {
+            sgRoot.rendering = false;
+        }
+    }
+
+    /**
+     * Whether a `subBoundingRect` query must refresh layout before reading the cached sub-part rect.
+     * Overridden by ArrayGrid-derived nodes: after a focus/scroll change the newly focused item's
+     * cached rect is stale (it still sits at its previous, pre-scroll position) until the next frame
+     * re-lays-out the grid — but an app's `rowItemFocused` observer measures it synchronously before
+     * that frame. Refreshing then makes the query report the settled focus-band position, matching a
+     * real device (where the observer fires after the render thread laid out the new focus). Default
+     * false so non-grid nodes keep returning their cached, at-most-one-frame-old sub-part rects.
+     */
+    protected needsSubBoundingRectRefresh(): boolean {
+        return false;
+    }
+
+    /**
      * Forces a render pass and returns the requested bounding rectangle.
      * @param type Rectangle type: `local`, `toScene`, or any other value for parent space.
      * @param interpreter Interpreter used to render the root path.
      * @returns Bounding rectangle in the requested coordinate space.
      */
     getBoundingRect(type: string, interpreter?: Interpreter): Rect {
-        // A bounding-rect query refreshes layout by rendering the whole tree from the root. When
-        // this is called from BrightScript that itself runs *during* a render (an observer or a
-        // freshly created item component's init() calling localBoundingRect/boundingRect), the
-        // re-render would re-enter rendering and recurse until the stack overflows (e.g. JellyRock
-        // RowList items measuring labels). Skip the refresh while a render is in progress and return
-        // the rects already computed by the active pass.
+        // A bounding-rect query refreshes layout by rendering the tree, then returns a cached rect.
+        // When called from BrightScript that runs *during* a render (an observer or a freshly created
+        // item component's init() measuring a Label), a full refresh would re-enter rendering and
+        // overflow the stack, so it is skipped while a render is in progress.
         if (interpreter && !sgRoot.rendering) {
-            const root = this.createPath()[0];
-            root.renderNode(interpreter, [0, 0], 0, 1);
+            this.refreshLayoutFromRoot(interpreter);
+        } else if (
+            interpreter &&
+            sgRoot.rendering &&
+            !sgRoot.measuring &&
+            (this.rectLocal.width <= 0 || this.rectLocal.height <= 0 || this.measureStale)
+        ) {
+            // Mid-render query on a node this pass hasn't laid out yet (its local rect is degenerate),
+            // or one whose subtree was written since its last measurement (`measureStale`).
+            // A full refresh is unavailable (it would re-enter the owning grid's item creation and
+            // recurse), so render just this node's own subtree to populate its rects. Either dimension
+            // zero signals "not measured" — a label first measured with empty text caches width 0 but
+            // a non-zero line height, so requiring both zero would skip the refresh and return a stale
+            // width. Measuring at origin [0,0] is fine: width/height are translation-invariant and the
+            // true origin is recomputed when the pass reaches the node. `measuring` bounds nested queries.
+            //
+            // `measureStale` is what makes REPEATED mid-render queries correct. A degenerate-rect test
+            // alone measures only the FIRST query of a render: once a rect is cached, every later query
+            // in that same render returns it verbatim, even after the app changed something. Apps size a
+            // background from a measured child in exactly that shape — set an icon, measure, set the
+            // text, measure again — and the second measurement silently returned the pre-text size, so
+            // the background fit the icon alone and the text overflowed it. The mark is set by
+            // `makeDirty()` (every field write), so this re-measures only when something actually
+            // changed; it is cleared below, so an unchanged repeat query still hits the cache.
+            //
+            // The subtree render's updateParentRects would union this child into its parent's cached
+            // bounds, but the parent hasn't been laid out this pass — unioning one child pollutes it
+            // with a partial rect (e.g. a button measured from its content group before its larger
+            // background sibling renders), making a later query on the parent skip its own fallback and
+            // return the too-small rect. Snapshot/restore the parent's rects so it stays degenerate and
+            // re-measures its full subtree when queried.
+            const parent = this.parent instanceof Node ? this.parent : undefined;
+            const savedLocal = parent ? { ...parent.rectLocal } : undefined;
+            const savedToParent = parent ? { ...parent.rectToParent } : undefined;
+            const savedToScene = parent ? { ...parent.rectToScene } : undefined;
+            sgRoot.measuring = true;
+            // A scoped subtree measurement never prunes (it can run nested inside a pruned
+            // full-tree refresh — e.g. item creation measuring a label): it measures at origin
+            // [0,0], so cached last-layout contexts from tree positions do not apply.
+            const wasPruning = sgRoot.pruneLayout;
+            sgRoot.pruneLayout = false;
+            try {
+                this.layoutNode(interpreter, [0, 0], 0, 1);
+            } finally {
+                sgRoot.measuring = false;
+                sgRoot.pruneLayout = wasPruning;
+                if (parent && savedLocal && savedToParent && savedToScene) {
+                    parent.rectLocal = savedLocal;
+                    parent.rectToParent = savedToParent;
+                    parent.rectToScene = savedToScene;
+                }
+                // The [0,0] measurement clobbered this subtree's rectToScene with origin-less
+                // values; deep-mark it so the next pruned refresh re-descends and re-establishes
+                // in-tree rects instead of skipping the settled subtree.
+                this.markSubtreeStaleDeep();
+                // ...but the SIZES this pass just computed are current (width/height are
+                // translation-invariant), so clear the measurement mark that the deep mark above
+                // re-set. Without this, the flag the fallback keys on is left set by the very pass
+                // meant to satisfy it, and every repeat query re-renders the subtree.
+                this.clearSubtreeMeasureStale();
+            }
         }
         switch (type) {
             case "local":
@@ -865,6 +1174,68 @@ export class Node extends RoSGNode implements BrsValue {
             default:
                 return this.rectToParent;
         }
+    }
+
+    /**
+     * Returns the bounding rectangle of an identified sub part (ifSGNodeBoundingRect's
+     * subBoundingRect/localSubBoundingRect/sceneSubBoundingRect). Sub parts (`itemX`, `itemX_Y`,
+     * `focusItem`, `focusIndicator`) only exist on ArrayGrid-derived nodes, which override
+     * `resolveSubpart`. Per the Roku spec, when the sub part does not exist the node's own
+     * bounding rectangle (in the requested coordinate space) is returned.
+     * @param type Rectangle type: `local`, `toScene`, or any other value for parent space.
+     * @param itemNumber Sub part identifier (e.g. "item3", "item4_11", "focusItem").
+     * @param interpreter Interpreter used to refresh layout before measuring.
+     * @returns Bounding rectangle of the sub part in the requested coordinate space.
+     */
+    getSubBoundingRect(type: string, itemNumber: string, interpreter?: Interpreter): Rect {
+        // If a focus/scroll change is pending (e.g. a vertical row change just fired its
+        // rowItemFocused observer before the next frame re-laid-out the grid), the cached item rects
+        // are stale — the newly focused item still sits at its previous, pre-scroll position. Refresh
+        // layout the same guarded way getBoundingRect does so subBoundingRect reports the settled
+        // focus-band position, matching a real device where the observer fires post-layout. Only when
+        // safe (not already inside a render) and only when actually needed (the dirty flag), so
+        // steady-state queries still read the cached rect without re-rendering per call.
+        if (interpreter && !sgRoot.rendering && this.needsSubBoundingRectRefresh()) {
+            this.refreshLayoutFromRoot(interpreter);
+        }
+        const subpart = this.resolveSubpart(itemNumber);
+        if (!subpart) {
+            // No such sub part: return the node's own bounding rect, refreshing layout the same way
+            // getBoundingRect does (guarded against re-entrant renders).
+            return this.getBoundingRect(type, interpreter);
+        }
+        // A resolved sub part is an already-rendered item component carrying a valid rect from the last
+        // frame. Do NOT force a full-tree re-render here (getBoundingRect): subBoundingRect is queried
+        // on every focus/scroll change, so re-rendering the whole scene per query is prohibitively slow
+        // AND can capture a transient, mid-layout size (an item briefly at the row's full itemSize
+        // instead of its poster size). The cached rects are at most one frame old, matching a real
+        // device (subBoundingRect reports the location at call time); for the fixed-focus lists that
+        // drive a focused-item overlay from this, the focused item's position is constant, so the cached
+        // value is exact. this.rect* are this node's own cached rects (it renders every frame), so they
+        // are consistent with the sub part's scene rect.
+        const subScene = subpart.rectToScene;
+        if (type === "toScene") {
+            return { ...subScene };
+        }
+        // The subpart rect is tracked in scene coordinates; re-express it relative to this
+        // node's position in the requested space.
+        const base = type === "local" ? this.rectLocal : this.rectToParent;
+        return {
+            x: base.x + (subScene.x - this.rectToScene.x),
+            y: base.y + (subScene.y - this.rectToScene.y),
+            width: subScene.width,
+            height: subScene.height,
+        };
+    }
+
+    /**
+     * Resolves a bounding-rect sub part identifier to a node. Only ArrayGrid-derived nodes
+     * have sub parts; the base implementation reports "no such sub part".
+     * @param _itemNumber Sub part identifier.
+     * @returns The sub part node, or undefined when the node has no such sub part.
+     */
+    protected resolveSubpart(_itemNumber: string): Node | undefined {
+        return undefined;
     }
 
     /**
@@ -939,7 +1310,13 @@ export class Node extends RoSGNode implements BrsValue {
      * @returns Whether the node is focusable.
      */
     setNodeFocus(focusOn: boolean): boolean {
-        const focusedChild = "focusedchild";
+        if (focusOn && Node.isFocusRequestDropped()) {
+            // Device-measured: Roku ignores a focus request raised from a focus-LOSS notification
+            // (see notifyStagedFocus). Report the request as not applied, so a subclass override
+            // gated on `super.setNodeFocus(...)` skips its focus bookkeeping too (an ArrayGrid must
+            // not move `itemFocused` for a grid that never took focus).
+            return false;
+        }
         if (focusOn) {
             if (!this.triedInitFocus) {
                 // Only try initial focus once
@@ -969,6 +1346,11 @@ export class Node extends RoSGNode implements BrsValue {
             const prevFocused = sgRoot.focused;
             sgRoot.setFocused(this);
 
+            // Stage every focusedChild write first, then notify. A Roku commits the whole focus
+            // transaction before it dispatches any focusedChild observer, so an observer always
+            // reads the FINISHED chain — never a half-rewritten one (device-measured).
+            const staged: StagedFocus[] = [];
+
             // If there was already a focused node somewhere, we need to remove focus
             // from it and its ancestors.
             if (prevFocused instanceof Node) {
@@ -985,37 +1367,138 @@ export class Node extends RoSGNode implements BrsValue {
 
                 // Unset all of the not-common ancestors of the current focused node.
                 for (let i = lcaIndex; i < currFocusChain.length; i++) {
-                    currFocusChain[i].setValue(focusedChild, BrsInvalid.Instance, false);
+                    currFocusChain[i].stageFocusedChild(BrsInvalid.Instance, staged);
                 }
             }
 
             // Set the focusedChild for each ancestor to the next node in the chain,
             // which is the current node's child.
             for (let i = 0; i < newFocusChain.length - 1; i++) {
-                newFocusChain[i].setValue(focusedChild, newFocusChain[i + 1], false);
+                newFocusChain[i].stageFocusedChild(newFocusChain[i + 1], staged);
             }
 
             // Finally, set the focusedChild of the newly focused node to itself (to mimic RBI behavior).
-            this.setValue(focusedChild, this, false);
+            this.stageFocusedChild(this, staged);
+
+            Node.notifyStagedFocus(staged, true);
         } else if (sgRoot.focused === this) {
             // If we're unsetting focus on ourself, we need to unset it on all ancestors as well.
             const currFocusedNode = sgRoot.focused;
             sgRoot.setFocused();
             // Get the focus chain, with root-most ancestor first.
             let currFocusChain = this.createPath(currFocusedNode as Node);
+            const staged: StagedFocus[] = [];
             for (const node of currFocusChain) {
-                node.setValue(focusedChild, BrsInvalid.Instance, false);
+                node.stageFocusedChild(BrsInvalid.Instance, staged);
             }
+            Node.notifyStagedFocus(staged);
         } else {
             // If the node doesn't have focus already, and it's not gaining focus,
             // we don't need to notify any ancestors.
-            this.setValue(focusedChild, BrsInvalid.Instance, false);
+            const staged: StagedFocus[] = [];
+            this.stageFocusedChild(BrsInvalid.Instance, staged);
+            Node.notifyStagedFocus(staged);
         }
         return this.isFocusable();
     }
 
     /**
+     * Writes this node's `focusedChild` WITHOUT notifying, recording the field in `staged` so the
+     * caller can dispatch it once the whole focus transaction is committed.
+     *
+     * The write goes through the regular (virtual) `setValue`, so subclass overrides still run —
+     * `Group` marks itself dirty so focus visuals repaint, `ScrollableText` tracks its focused
+     * state. Only the notification is held back, via `focusStagingSink`.
+     * @param value The new focusedChild value.
+     * @param staged Accumulator the caller later hands to `notifyStagedFocus`.
+     */
+    private stageFocusedChild(value: BrsType, staged: StagedFocus[]) {
+        const previousSink = Node.focusStagingSink;
+        Node.focusStagingSink = staged;
+        try {
+            this.setValue("focusedchild", value, false);
+        } finally {
+            Node.focusStagingSink = previousSink;
+        }
+    }
+
+    /**
+     * Dispatches the staged `focusedChild` notifications for a committed focus transaction, in
+     * chain order (the subtree losing focus first, then the one gaining it).
+     * @param staged Fields staged by `stageFocusedChild`.
+     * @param gaining True when a node is taking focus, so a competing request raised from one of
+     *   these callbacks can be classified — see `isFocusRequestDropped`. False for the unfocus
+     *   paths: with no node taking focus there is nothing to defend, and dropping an observer's
+     *   restore there would leave the app with no focused node at all.
+     */
+    private static notifyStagedFocus(staged: StagedFocus[], gaining = false) {
+        // Marks these as an engine-initiated focus emission, so notifications raised during a
+        // component's init() defer until init returns (see Field.enterInit).
+        Field.enterFocusEmission();
+        try {
+            for (const entry of staged) {
+                if (gaining) {
+                    Node.focusNotifyOwners.push(entry.node);
+                }
+                try {
+                    entry.field.notifyObservers();
+                } finally {
+                    if (gaining) {
+                        Node.focusNotifyOwners.pop();
+                    }
+                }
+            }
+        } finally {
+            Field.exitFocusEmission();
+        }
+    }
+
+    /** Resets focus-dispatch state between app runs so nothing leaks across setups. */
+    static resetFocusDispatch() {
+        Node.focusNotifyOwners.length = 0;
+    }
+
+    /**
+     * Whether a `setFocus(true)` issued right now must be ignored.
+     *
+     * Device-measured: a Roku honors a focus request raised from a `focusedChild` observer only when
+     * the observed node is still in the focus chain — the "forward focus" pattern where a container
+     * that just GAINED focus hands it to an inner widget. A request raised from the mirror-image
+     * notification, by a node that just LOST focus, is dropped: the chain and the remote stay with
+     * the node the in-flight transaction focused.
+     *
+     * That asymmetry is what makes an app which re-grabs focus from its own focus-loss observer
+     * behave on a device and not here: the engine used to let the re-grab win the live focus while
+     * the outer transaction still wrote its own chain, leaving `sgRoot.focused` and `focusedChild`
+     * pointing at different nodes.
+     * @returns True when the in-flight notification is a focus loss, so the request is ignored.
+     */
+    private static isFocusRequestDropped(): boolean {
+        const owner = Node.focusNotifyOwners.at(-1);
+        const focused = sgRoot.focused;
+        if (!owner || !(focused instanceof Node)) {
+            return false;
+        }
+        // Is the owner still in the focus chain? Cheap upward walk from the focused node, the same
+        // shape restoreFocusChainOnAttach uses — an O(subtree) descent would be walked on every
+        // focus request made from inside a notification.
+        let ancestor: BrsType = focused;
+        while (ancestor instanceof Node && ancestor !== owner) {
+            ancestor = ancestor.parent;
+        }
+        return ancestor !== owner;
+    }
+
+    /**
      * Searches the subtree rooted at the provided node for a matching `id`.
+     *
+     * Per Roku's ifSGNodeDict spec, findNode is a BREADTH-FIRST search: every node at one depth
+     * is tested before any deeper node. This matters when ids collide across depths — a
+     * depth-first walk would descend into an earlier sibling's subtree (including a custom
+     * component's internal children) and return a deep node whose id shadows a shallower
+     * sibling's (e.g. a list container whose first child component internally names a node
+     * "rowList" while the container's own sibling grid is "RowList" — breadth-first, matching a
+     * device, resolves to the sibling).
      * @param node Root to inspect.
      * @param id Identifier to seek (case-insensitive).
      * @param ignoreRoot Whether to ignore the root node in the search.
@@ -1028,25 +1511,34 @@ export class Node extends RoSGNode implements BrsValue {
         ignoreRoot?: boolean,
         visited: WeakSet<Node> = new WeakSet()
     ): Node | BrsInvalid {
-        if (!ignoreRoot) {
-            // test current node in tree
-            const myId = node.getValue("id");
-            if (myId?.toString().toLowerCase() === id.toLowerCase()) {
-                return node;
+        const target = id.toLowerCase();
+        const queue: Node[] = [];
+        if (ignoreRoot) {
+            visited.add(node);
+            for (const child of node.children) {
+                if (child instanceof Node) {
+                    queue.push(child);
+                }
             }
+        } else {
+            queue.push(node);
         }
-        if (visited.has(node)) {
-            return BrsInvalid.Instance;
-        }
-        visited.add(node);
-        // visit each child
-        for (const child of node.children) {
-            if (!(child instanceof Node)) {
+        let head = 0;
+        while (head < queue.length) {
+            const current = queue[head];
+            head++;
+            if (visited.has(current)) {
                 continue;
             }
-            const result = this.findNodeById(child, id, false, visited);
-            if (result instanceof Node) {
-                return result;
+            visited.add(current);
+            const myId = current.getValue("id");
+            if (myId?.toString().toLowerCase() === target) {
+                return current;
+            }
+            for (const child of current.children) {
+                if (child instanceof Node) {
+                    queue.push(child);
+                }
             }
         }
         // name was not found anywhere in tree
@@ -1271,6 +1763,25 @@ export class Node extends RoSGNode implements BrsValue {
             } else if (fieldName === "subtype") {
                 // Skip the "subtype" field, already handled
                 continue;
+            } else if (
+                value instanceof RoAssociativeArray &&
+                this.isNodeCreationDirective(node, fieldName, value, createFields)
+            ) {
+                // A nested AA carrying a "subtype" key is a node-creation directive on real Roku
+                // for ANY field - not just "children" array elements - as long as the target
+                // field either doesn't exist yet (createFields) or is already typed as Node; a
+                // field declared with another type keeps the AA as a literal value (see below).
+                const childSubtype = jsValueOf(value.get(new BrsString("subtype"))) ?? subtype;
+                const childNode = createNode(childSubtype, interpreter);
+                if (childNode instanceof RoSGNode) {
+                    this.populateNodeFromAA(interpreter, childNode, value, createFields, childSubtype);
+                    node.setValue(key, childNode, false, FieldKind.Node);
+                } else {
+                    // Unknown/invalid subtype: the field is still typed as Node (matching Roku),
+                    // but its value is Invalid since no node could be created.
+                    node.setValue(key, BrsInvalid.Instance, false, FieldKind.Node);
+                }
+                this.makeDirty();
             }
             // Set all other fields, respecting the createFields parameter
             else if (node.hasNodeField(fieldName) || (createFields && !isInvalid(value))) {
@@ -1278,6 +1789,31 @@ export class Node extends RoSGNode implements BrsValue {
                 this.makeDirty();
             }
         }
+    }
+
+    /**
+     * Checks whether a nested AA value (from an update()/populateNodeFromAA call) carrying a
+     * `subtype` key should be treated as a node-creation directive for `fieldName` on `node`,
+     * matching Roku's behavior: this applies to any field, but only when the target field either
+     * doesn't exist yet (and will be freshly created) or already has FieldKind.Node - a field
+     * declared with another type (e.g. assocarray) is left storing the AA as a literal value.
+     * @param node Node the field belongs to.
+     * @param fieldName Lowercased field name being set.
+     * @param value Candidate AA value for the field.
+     * @param createFields Whether new fields may be created by this update() call.
+     * @returns True when `value` should be converted into a real node instead of stored as-is.
+     */
+    private isNodeCreationDirective(
+        node: Node,
+        fieldName: string,
+        value: RoAssociativeArray,
+        createFields: boolean
+    ): boolean {
+        if (value.get(new BrsString("subtype")) instanceof BrsInvalid) {
+            return false;
+        }
+        const field = node.resolveField(fieldName);
+        return field ? field.getType() === FieldKind.Node : createFields;
     }
 
     /**
@@ -1311,6 +1847,18 @@ export class Node extends RoSGNode implements BrsValue {
     }
 
     /**
+     * Detaches a child from its current parent before attaching it elsewhere.
+     * Roku nodes have exactly one parent: appendChild/insertChild/replaceChild reparent implicitly.
+     * @param child Child about to be attached to this node.
+     */
+    protected detachFromCurrentParent(child: Node) {
+        const oldParent = child.getNodeParent();
+        if (oldParent instanceof RoSGNode && oldParent !== this) {
+            oldParent.removeChildByReference(child);
+        }
+    }
+
+    /**
      * Removes a contiguous range of children starting at the provided index.
      * @param index Start index.
      * @param count Number of children to remove.
@@ -1332,7 +1880,9 @@ export class Node extends RoSGNode implements BrsValue {
     }
 
     /**
-     * Appends a child node to this node's children collection.
+     * Appends a child node to this node's children collection. Appending a node that is
+     * already a child MOVES it to the end (matching a real device): apps reorder a list by
+     * re-appending an existing child — e.g. "move this menu entry after the one just added".
      * @param child Child to append.
      * @returns True when the child was appended.
      */
@@ -1340,12 +1890,17 @@ export class Node extends RoSGNode implements BrsValue {
         if (child instanceof Node) {
             const existingIndex = this.children.indexOf(child);
             if (existingIndex >= 0) {
-                // Re-appending a child that is already present moves it to the end (z-order to
-                // front), matching the device — it is not a no-op. Widgets rely on this (e.g. a
-                // cross-fade poster re-appends the freshly-loaded child so it renders on top).
+                if (existingIndex === this.children.length - 1) {
+                    return true;
+                }
                 this.children.splice(existingIndex, 1);
-                this.recordChildChange("remove", existingIndex);
+                this.recordChildChange("remove", existingIndex, existingIndex);
+                this.children.push(child);
+                this.makeDirty();
+                this.recordChildChange("add", this.children.length - 1);
+                return true;
             }
+            this.detachFromCurrentParent(child);
             const insertionIndex = this.children.length;
             this.children.push(child);
             child.setNodeParent(this);
@@ -1382,6 +1937,7 @@ export class Node extends RoSGNode implements BrsValue {
         if (oldChild instanceof Node) {
             oldChild.removeParent();
         }
+        this.detachFromCurrentParent(newChild);
         newChild.setNodeParent(this);
         this.children.splice(index, 1, newChild);
         this.makeDirty();
@@ -1420,6 +1976,7 @@ export class Node extends RoSGNode implements BrsValue {
             this.recordChildChange("insert", index, index);
             return true;
         }
+        this.detachFromCurrentParent(child);
         child.setNodeParent(this);
         this.children.splice(index, 0, child);
         this.makeDirty();
@@ -1480,8 +2037,12 @@ export class Node extends RoSGNode implements BrsValue {
      */
     protected findRootNode(start?: Node): Node {
         let root: Node = start ?? this;
-        while (root.parent instanceof Node) {
-            root = root.parent;
+        // Walk through getNodeParent() rather than the raw field so a node whose parent link is
+        // resolved on demand participates — the global node reports the Scene as its parent.
+        let parent = root.getNodeParent();
+        while (parent instanceof Node) {
+            root = parent;
+            parent = root.getNodeParent();
         }
         return root;
     }
@@ -1553,7 +2114,15 @@ export class Node extends RoSGNode implements BrsValue {
                             signature: satisfiedSignature.signature,
                         });
                         addedToStack = true;
-                        const returnValue = functionToCall.call(subInterpreter, ...args);
+                        const boxedArgs = args.map((arg) => {
+                            if (arg instanceof RoArray || arg instanceof RoAssociativeArray) {
+                                arg.boxLiterals();
+                            } else if (isBoxable(arg)) {
+                                return arg.box();
+                            }
+                            return arg;
+                        });
+                        const returnValue = functionToCall.call(subInterpreter, ...boxedArgs);
                         interpreter.popFromStack();
                         interpreter.location = originalLocation;
                         return returnValue;
@@ -1697,11 +2266,91 @@ export class Node extends RoSGNode implements BrsValue {
      */
     protected makeDirty() {
         this.changed = true;
+        this.markSubtreeStale();
         if (sgRoot.inTaskThread() && this.parent instanceof Node) {
             const root = this.findRootNode();
             root.changed = true;
         }
         sgRoot.makeDirty();
+    }
+
+    /**
+     * Marks this node and every ancestor stale for the pruned layout refresh. Walks the FULL
+     * parent chain (O(depth), trivial next to the cost of the setValue that got us here) rather
+     * than early-exiting at the first stale ancestor: a node whose own pass never runs (a
+     * hard-skipped invisible leaf, an off-screen grid item) keeps its stale mark while its
+     * ancestors' marks are cleared by their passes, so "this node is stale" does not imply the
+     * chain above it still is — an early exit would strand the write in a skipped subtree.
+     */
+    markSubtreeStale() {
+        this.subtreeStale = true;
+        this.measureStale = true;
+        let ancestor = this.parent instanceof Node ? this.parent : undefined;
+        while (ancestor) {
+            ancestor.subtreeStale = true;
+            ancestor.measureStale = true;
+            ancestor = ancestor.parent instanceof Node ? ancestor.parent : undefined;
+        }
+    }
+
+    /**
+     * Marks this node, every descendant, AND the ancestor chain stale. Required after a scoped
+     * measurement rendered this subtree at origin [0,0] (`measureUnsizedChildren`,
+     * `getBoundingRect`'s mid-render fallback): that pass overwrites every descendant's
+     * `rectToScene` with origin-less values, relying on "the true origin is recomputed when the
+     * next pass reaches the node" — which a pruned refresh would skip. The deep mark forces the
+     * next refresh to re-descend and re-establish in-tree rects; the up-mark makes sure the
+     * refresh actually reaches this subtree.
+     */
+    markSubtreeStaleDeep() {
+        this.markSubtreeStale();
+        const stack: Node[] = [this];
+        while (stack.length > 0) {
+            const node = stack.pop()!;
+            node.subtreeStale = true;
+            for (const child of node.children) {
+                if (child instanceof Node) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    /**
+     * Clears `measureStale` on this node and every descendant after a scoped measurement pass
+     * computed their sizes. Only the sizes are guaranteed current — `subtreeStale` deliberately
+     * stays set, because the pass ran at origin [0,0] and left the subtree's scene-space origins
+     * wrong for anything but a full refresh. Ancestors are NOT cleared: they were not measured, so
+     * a later query on one must still re-measure to pick this subtree's new size up.
+     */
+    private clearSubtreeMeasureStale() {
+        const stack: Node[] = [this];
+        while (stack.length > 0) {
+            const node = stack.pop()!;
+            node.measureStale = false;
+            for (const child of node.children) {
+                if (child instanceof Node) {
+                    stack.push(child);
+                }
+            }
+        }
+    }
+
+    /**
+     * Marks this instance as an address-only stand-in for a node owned by another thread, so reads
+     * of fields it has not mirrored yet rendezvous to the owner instead of answering `invalid`.
+     * @param isProxy Whether the node was rebuilt from a bare reference.
+     */
+    public setRemoteProxy(isProxy: boolean) {
+        this.remoteProxy = isProxy;
+    }
+
+    /**
+     * Whether this instance is an address-only stand-in for a node owned by another thread.
+     * @returns True when the node was rebuilt from a bare reference.
+     */
+    public isRemoteProxy(): boolean {
+        return this.remoteProxy;
     }
 
     /**
@@ -1794,9 +2443,10 @@ export class Node extends RoSGNode implements BrsValue {
      * Used both for the render thread's own field sets and to propagate a set the render applied on
      * behalf of a Task to the *other* observing tasks (cross-task propagation).
      * @param fieldName Field whose current value should be delivered.
-     * @param excludeThreadId Task thread id to skip (e.g. the originating task); -1 skips none.
+     * @param excludeThreadIds Task thread ids to skip — the originating task, plus any thread the
+     *   caller has already delivered to by another route (which would otherwise double-fire).
      */
-    fanOutFieldToObservingTasks(fieldName: string, excludeThreadId: number = -1) {
+    fanOutFieldToObservingTasks(fieldName: string, ...excludeThreadIds: number[]) {
         if (sgRoot.inTaskThread()) {
             return;
         }
@@ -1806,7 +2456,14 @@ export class Node extends RoSGNode implements BrsValue {
         }
         const value = field.getValue(false);
         for (const task of sgRoot.threadTasks) {
-            if (task.active && task.threadId !== excludeThreadId && field.isPortObserved(task)) {
+            // Deliver only to the threads that actually registered a port observer. `isPortObserved`
+            // cannot distinguish them (see `Field.remotePortObservers`) — using it here broadcast
+            // every update to every active task, which swamped the single-slot fan-out buffers.
+            if (
+                task.active &&
+                !excludeThreadIds.includes(task.threadId) &&
+                (field.isPortObserved(task) || field.hasRemotePortObserver(task.threadId))
+            ) {
                 task.syncRemoteField(fieldName, value, this.syncType, this.address);
             }
         }
@@ -1834,7 +2491,11 @@ export class Node extends RoSGNode implements BrsValue {
             const args = callArgs?.map((arg: BrsType) => {
                 if (arg instanceof Node) {
                     arg.setOwner(0); // Node references sent to render thread will be owned by the render thread
-                    return fromSGNode(arg, true);
+                    // Pass the task as host so port-observed fields are flagged `_observed_`. A node
+                    // built *inside* a task and observed there (the request/result node of a worker
+                    // pool) is task-owned at `observeField` time, so that call never rendezvoused and
+                    // the render thread would otherwise have no idea anyone is waiting on it.
+                    return fromSGNode(arg, true, task);
                 }
                 return jsValueOf(arg);
             });

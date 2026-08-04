@@ -21,21 +21,76 @@ import {
     BrsObjects,
     Callable,
     StdlibArgument,
+    BrsDevice,
+    Expr,
+    resolveAnonymousCallable,
+    toCallable,
+    RoMessagePort,
 } from "brs-engine";
 import { createFlatNode } from "./NodeFactory";
 import { ContentNode, Node, SGNodeType } from "../nodes";
 import { FieldKind, ObservedField } from "../SGTypes";
 import { sgRoot } from "../SGRoot";
+import { RoSGNodeEvent } from "../events/RoSGNodeEvent";
+
+/**
+ * A `visited` view that forwards to a base set but can undo its own additions.
+ *
+ * Nodes normally stay in `visited` for a whole pass so a node reachable twice is deduped as a
+ * `_circular_` stub. That is wrong for a node's script-scope `m` (`_m_`), which is an *extra* copy
+ * of state that is usually also reachable from the enclosing pass — a Task's `m` serializes `m.top`
+ * (emitting its `_m_`) before its own sibling entries, so those siblings would degrade to stubs the
+ * receiver cannot resolve (`loadTaskData` rebuilds each entry with its own node map) and read back
+ * as `invalid`. Serializing `_m_` through a scoped view keeps cycle detection intact for the `_m_`
+ * subtree while leaving the enclosing pass free to serialize those values in full.
+ */
+class ScopedVisited {
+    private readonly added: object[] = [];
+    readonly [Symbol.toStringTag] = "WeakSet";
+
+    constructor(private readonly base: WeakSet<object>) {}
+
+    has(value: object): boolean {
+        return this.base.has(value);
+    }
+
+    add(value: object): this {
+        if (!this.base.has(value)) {
+            this.added.push(value);
+        }
+        this.base.add(value);
+        return this;
+    }
+
+    delete(value: object): boolean {
+        const index = this.added.indexOf(value);
+        if (index >= 0) {
+            this.added.splice(index, 1);
+        }
+        return this.base.delete(value);
+    }
+
+    /** Removes everything this view added, restoring the base set to its pre-scope state. */
+    rollback() {
+        for (const value of this.added) {
+            this.base.delete(value);
+        }
+        this.added.length = 0;
+    }
+}
 
 /**
  * Converts a BrsType value to its representation as a JavaScript type.
  * @param {BrsType} value Some BrsType value.
  * @param {boolean} deep Whether to recursively convert nested structures. Defaults to true.
  * @param {Node} host Optional host node for observing context.
- * @param {WeakSet<Node>} visitedNodes Optional set to track visited nodes for circular reference detection.
+ * @param {WeakSet<object>} visited Optional set tracking visited nodes and containers for circular
+ * reference detection. Nodes stay in the set for the whole pass (deduped as `_circular_` stubs);
+ * arrays/AAs are tracked per-path (entered on descent, released on return) so a container referenced
+ * twice still serializes both times, while a container reachable from itself serializes as `null`.
  * @return {any} The JavaScript representation of `x`.
  */
-export function jsValueOf(value: BrsType, deep: boolean = true, host?: Node, visitedNodes?: WeakSet<object>): any {
+export function jsValueOf(value: BrsType, deep: boolean = true, host?: Node, visited?: WeakSet<object>): any {
     if (value?.kind === undefined) {
         return undefined;
     } else if (isUnboxable(value)) {
@@ -59,21 +114,60 @@ export function jsValueOf(value: BrsType, deep: boolean = true, host?: Node, vis
         case ValueKind.Interface:
         case ValueKind.Object:
             if (value instanceof RoArray || value instanceof RoList) {
-                return value.elements.map((el) => jsValueOf(el, deep, host, visitedNodes));
+                visited ??= new WeakSet<object>();
+                if (visited.has(value)) {
+                    warnCyclicContainer(value.getComponentName());
+                    return null;
+                }
+                visited.add(value);
+                try {
+                    const elements = value.elements.map((el) => jsValueOf(el, deep, host, visited));
+                    return elements;
+                } finally {
+                    visited.delete(value);
+                }
             } else if (value instanceof RoByteArray) {
                 return value.elements;
             } else if (value instanceof Node) {
-                return fromSGNode(value, deep, host, visitedNodes);
+                return fromSGNode(value, deep, host, visited);
             } else if (value instanceof RoAssociativeArray) {
-                return fromAssociativeArray(value, deep, host, visitedNodes);
+                if (visited?.has(value)) {
+                    warnCyclicContainer(value.getComponentName());
+                    return null;
+                }
+                return fromAssociativeArray(value, deep, host, visited);
             } else if (value instanceof BrsComponent) {
                 return { _component_: value.getComponentName() };
             } else if (value instanceof BrsInterface) {
                 return { _interface_: value.getInterfaceName() };
             }
             break;
-        case ValueKind.Callable:
-            return { _callable_: value.name };
+        case ValueKind.Callable: {
+            const result: FlexObject = { _callable_: value.name ?? "" };
+            // A user-defined function can be faithfully rebuilt on the receiving thread from its
+            // source AST (BrightScript has no lexical closures — `m` binds to the receiver at call
+            // time), so ship its source location for the AST lookup in `restoreCallable`.
+            const location = value.isUserDefined() ? value.getLocation() : undefined;
+            if (location) {
+                result["_location_"] = {
+                    file: location.file,
+                    line: location.start.line,
+                    column: location.start.column,
+                };
+            }
+            return result;
+        }
+    }
+}
+
+/** One-shot warning when a cyclic container is dropped during cross-thread serialization. */
+let warnedCyclicContainer = false;
+function warnCyclicContainer(componentName: string) {
+    if (!warnedCyclicContainer) {
+        warnedCyclicContainer = true;
+        BrsDevice.stderr.write(
+            `warning,[sg] Dropped circular ${componentName} reference during cross-thread serialization`
+        );
     }
 }
 
@@ -118,29 +212,30 @@ export function brsValueOf(value: any, cs?: boolean, nodeMap?: Map<string, Node>
  * @param aa The RoAssociativeArray to convert.
  * @param deep Whether to recursively convert nested structures. Defaults to true.
  * @param host Optional host node for observing context.
- * @param visitedNodes Optional set to track visited nodes for circular reference detection.
+ * @param visited Optional set tracking visited nodes and containers for circular reference detection.
  * @returns A JavaScript object with the converted properties.
  */
 export function fromAssociativeArray(
     aa: RoAssociativeArray,
     deep: boolean = true,
     host?: Node,
-    visitedNodes?: WeakSet<object>
+    visited?: WeakSet<object>
 ): FlexObject {
-    // Guard against cyclic associative arrays (an AA that transitively contains itself). Without
-    // this, jsValueOf <-> fromAssociativeArray recurses until the JS stack overflows ("Maximum call
-    // stack size exceeded"). fromSGNode already guards node cycles with the same visited set; share
-    // it so AA<->node cycles are covered too.
-    visitedNodes ??= new WeakSet<object>();
-    if (visitedNodes.has(aa)) {
-        return { _circular_: "roAssociativeArray" };
+    visited ??= new WeakSet<object>();
+    if (visited.has(aa)) {
+        warnCyclicContainer(aa.getComponentName());
+        return {};
     }
-    visitedNodes.add(aa);
-    const result: FlexObject = {};
-    for (const [key, value] of aa.elements) {
-        result[key] = jsValueOf(value, deep, host, visitedNodes);
+    visited.add(aa);
+    try {
+        const result: FlexObject = {};
+        for (const [key, value] of aa.elements) {
+            result[key] = jsValueOf(value, deep, host, visited);
+        }
+        return result;
+    } finally {
+        visited.delete(aa);
     }
-    return result;
 }
 
 /**
@@ -214,18 +309,154 @@ function fromObject(obj: any, cs?: boolean, nodeMap?: Map<string, Node>): BrsTyp
     } else if (obj["_interface_"]) {
         return BrsInvalid.Instance;
     } else if (obj["_callable_"]) {
-        return new Callable(obj["_callable_"], {
-            signature: {
-                args: [new StdlibArgument("arg", ValueKind.Dynamic, BrsInvalid.Instance)],
-                variadic: true,
-                returns: ValueKind.Void,
-            },
-            impl: (_: any, ..._arg: BrsType[]) => {
-                return Uninitialized.Instance;
-            },
-        });
+        return restoreCallable(obj["_callable_"], obj["_location_"]);
     }
     return toAssociativeArray(obj, cs, nodeMap);
+}
+
+/** Serialized source position of a user-defined callable (see `jsValueOf`'s Callable case). */
+interface SerializedCallableLocation {
+    file: string;
+    line: number;
+    column: number;
+}
+
+/**
+ * Restores a function value transferred from another thread. A serialized callable is only a name
+ * plus (for user-defined functions) a source location, so resolution tries, in order:
+ * 1. The anonymous-callable registry — covers a `$anon_N` round-tripping back to the thread that
+ *    minted it (the registry is per-worker).
+ * 2. Rebuilding from the component AST retained by `setupInterpreterWithSubEnvs`, located by the
+ *    serialized file/line/column. BrightScript has no lexical closures (`m` binds to the receiver
+ *    at call time), so the AST alone reproduces the function faithfully — matching a device, where
+ *    a Task's copy of `m` keeps its function references callable.
+ * 3. A stub that returns `uninitialized` (what the call site would see for a lost function), with
+ *    a one-shot warning so the failure is never silent.
+ * @param name The callable's name (`$anon_N` for anonymous functions).
+ * @param location The serialized source location, when the function was user-defined.
+ * @returns The restored (or stub) Callable.
+ */
+function restoreCallable(name: string, location?: SerializedCallableLocation): Callable {
+    if (name.toLowerCase().startsWith("$anon_")) {
+        const anon = resolveAnonymousCallable(name);
+        // Each worker mints `$anon_N` names independently, so a registry hit may be a different
+        // function that happens to share the name — trust it only when the source location agrees
+        // (or when no location was serialized, the pre-existing name-only behavior).
+        const anonLoc = anon?.getLocation();
+        if (
+            anon &&
+            (!location ||
+                (anonLoc?.file === location.file &&
+                    anonLoc.start.line === location.line &&
+                    anonLoc.start.column === location.column))
+        ) {
+            return anon;
+        }
+    }
+    if (location) {
+        const funcExpr = findFunctionExpression(location);
+        if (funcExpr) {
+            return toCallable(funcExpr, name);
+        }
+    }
+    warnLostCallable(name);
+    return new Callable(name, {
+        signature: {
+            args: [new StdlibArgument("arg", ValueKind.Dynamic, BrsInvalid.Instance)],
+            variadic: true,
+            returns: ValueKind.Void,
+        },
+        impl: (_: any, ..._arg: BrsType[]) => {
+            return Uninitialized.Instance;
+        },
+    });
+}
+
+/** One-shot warning when a transferred function value cannot be restored on this thread. */
+let warnedLostCallable = false;
+function warnLostCallable(name: string) {
+    if (!warnedLostCallable) {
+        warnedLostCallable = true;
+        BrsDevice.stderr.write(
+            `warning,[sg] Unable to restore function "${name}" across threads; calls to it will return uninitialized`
+        );
+    }
+}
+
+/**
+ * Locates a function expression in the retained component ASTs by its source position.
+ * Results are memoized per position — a Task's `m` is re-serialized on every sync, so the same
+ * function is looked up repeatedly.
+ * @param location Source position captured when the callable was serialized.
+ * @returns The matching function expression, or undefined when not found.
+ */
+function findFunctionExpression(location: SerializedCallableLocation): Expr.Function | undefined {
+    const defMap = sgRoot.nodeDefMap;
+    let cache = functionExprCache.get(defMap);
+    if (!cache) {
+        cache = new Map<string, Expr.Function | undefined>();
+        functionExprCache.set(defMap, cache);
+    }
+    const key = `${location.file}:${location.line}:${location.column}`;
+    if (cache.has(key)) {
+        return cache.get(key);
+    }
+    let found: Expr.Function | undefined;
+    const seen = new Set<any>();
+    for (const def of defMap.values()) {
+        if (!def.scopeStatements) {
+            continue;
+        }
+        found = walkForFunction(def.scopeStatements, location, seen);
+        if (found) {
+            break;
+        }
+    }
+    cache.set(key, found);
+    return found;
+}
+
+// Memoized per nodeDefMap instance so a new app load (which replaces the map) can't serve stale ASTs.
+const functionExprCache = new WeakMap<Map<string, any>, Map<string, Expr.Function | undefined>>();
+
+/**
+ * Depth-first search over AST nodes for an `Expr.Function` starting at the given position.
+ * Walks own enumerable properties generically (the AST is a tree of plain objects/arrays), so it
+ * finds functions nested in any statement or expression, including anonymous functions inside AA
+ * literals. `seen` guards shared sub-trees across components (inherited/library statements are the
+ * same object instances in every component that includes them).
+ * @param value AST node, array of nodes, or leaf value to search.
+ * @param location Source position to match against `Expr.Function.location.start`.
+ * @param seen Object identity guard for already-visited AST nodes.
+ * @returns The matching function expression, or undefined.
+ */
+function walkForFunction(value: any, location: SerializedCallableLocation, seen: Set<any>): Expr.Function | undefined {
+    if (value === null || typeof value !== "object" || seen.has(value)) {
+        return undefined;
+    }
+    seen.add(value);
+    if (value instanceof Expr.Function) {
+        const loc = value.location;
+        if (loc.file === location.file && loc.start.line === location.line && loc.start.column === location.column) {
+            return value;
+        }
+    }
+    if (Array.isArray(value)) {
+        for (const item of value) {
+            const found = walkForFunction(item, location, seen);
+            if (found) {
+                return found;
+            }
+        }
+        return undefined;
+    }
+    for (const propKey of Object.keys(value)) {
+        const found = walkForFunction(value[propKey], location, seen);
+        if (found) {
+            return found;
+        }
+    }
+    return undefined;
 }
 
 /**
@@ -237,6 +468,46 @@ function fromObject(obj: any, cs?: boolean, nodeMap?: Map<string, Node>): BrsTyp
  * @param nodeMap Optional map to track nodes by ID for resolving circular references.
  * @returns A RoSGNode with the converted fields and optionally its children.
  */
+/**
+ * Attributes a rebuilt node's `_observed_` port observations to the thread they came from.
+ *
+ * A node built inside a task and observed there with a port carries those observations across, but
+ * the port itself cannot travel. Recording the originating thread against each field lets the render
+ * thread fan later updates back to where the real port is waiting.
+ * @param obj Serialized node data.
+ * @param node The rebuilt node.
+ */
+function applyRemotePortObservers(obj: any, node: Node) {
+    const observed = obj["_observed_"];
+    const threadId = sgRoot.deserializingThread;
+    if (threadId < 0 || !Array.isArray(observed)) {
+        return;
+    }
+    for (const entry of observed) {
+        if (typeof entry?.name === "string") {
+            node.resolveField(entry.name.toLowerCase())?.addRemotePortObserver(threadId);
+        }
+    }
+}
+
+/**
+ * Constructs a bare node of the given type, without running any render-side initialization.
+ *
+ * The `deserializing` guard keeps media nodes (Video/Audio) rebuilt as cross-thread copies from
+ * running their render-init, which would hijack the singleton `sgRoot.video`/`audio` and reset the
+ * real player. The prior value is restored so nested/recursive deserialization stays correct.
+ * @param type Serialized node type.
+ * @param subtype Serialized node subtype.
+ * @returns The new node, falling back to a plain `Node` for an unknown type.
+ */
+function buildFlatNode(type: string, subtype: string): Node {
+    const wasDeserializing = sgRoot.deserializing;
+    sgRoot.deserializing = true;
+    const created = createFlatNode(type, subtype);
+    sgRoot.deserializing = wasDeserializing;
+    return created instanceof BrsInvalid ? new Node([], subtype) : created;
+}
+
 export function toSGNode(obj: any, type: string, subtype: string, child?: boolean, nodeMap?: Map<string, Node>): Node {
     // Initialize nodeMap on first call
     nodeMap ??= new Map<string, Node>();
@@ -247,19 +518,31 @@ export function toSGNode(obj: any, type: string, subtype: string, child?: boolea
         if (existingNode) {
             return existingNode;
         }
-        // If we don't have the node yet, this might be a forward reference
-        // Return invalid for now (should not happen in valid serialized data)
-        return BrsInvalid.Instance as any;
+        // The node this points at was not rebuilt on this thread: the pass reached it by a route
+        // it does not restore locally — a runtime-appended child of the task node, say, whose
+        // `_children_` the receiver does not replay. The owner still resolves the address (it was
+        // registered when the full copy was written), so stand in an address-only proxy and let
+        // reads rendezvous. Answering invalid here crashes the app's first dot access instead.
+        const stub = buildFlatNode(type, subtype);
+        stub.setAddress(obj["_address_"]);
+        stub.setOwner(0);
+        stub.setRemoteProxy(true);
+        nodeMap.set(obj["_address_"], stub);
+        sgRoot.registerCrossThreadNode(stub);
+        return stub;
     }
-    let newNode = createFlatNode(type, subtype);
-    if (newNode instanceof BrsInvalid) {
-        newNode = new Node([], subtype);
-    }
+    const newNode = buildFlatNode(type, subtype);
     // Store the node in the map using the original address for circular reference resolution
     // Use the address from serialized data if available, otherwise use the new node's address
     newNode.setAddress(obj["_address_"] || newNode.getAddress());
     newNode.setOwner(obj["_owner_"] ?? 0);
+    // A bare reference carries no fields, so mark the rebuilt node as incomplete: a read of a field
+    // it has not mirrored must rendezvous to the owner rather than answer invalid (see Node.get).
+    if (obj["_proxy_"]) {
+        newNode.setRemoteProxy(true);
+    }
     nodeMap.set(newNode.getAddress(), newNode);
+    sgRoot.registerCrossThreadNode(newNode);
 
     const fieldTypes = obj["_fieldtypes_"] ?? {};
     for (const key in obj) {
@@ -269,6 +552,7 @@ export function toSGNode(obj: any, type: string, subtype: string, child?: boolea
         const kind = FieldKind.fromString(fieldTypes[key] ?? "");
         newNode.setValueSilent(key, brsValueOf(obj[key], undefined, nodeMap), undefined, kind);
     }
+    applyRemotePortObservers(obj, newNode);
     // Recreate fields whose `invalid`/uninitialized value was omitted by JSON serialization, using
     // the preserved declared type so they exist (as `invalid`) on the receiving thread.
     for (const key in fieldTypes) {
@@ -276,6 +560,7 @@ export function toSGNode(obj: any, type: string, subtype: string, child?: boolea
             newNode.setValueSilent(key, BrsInvalid.Instance, undefined, FieldKind.fromString(fieldTypes[key]));
         }
     }
+    restoreScriptScopeM(obj["_m_"], newNode, nodeMap);
     if (child && obj["_children_"]) {
         for (const child of obj["_children_"]) {
             const childInfo = getSerializedNodeInfo(child);
@@ -288,6 +573,92 @@ export function toSGNode(obj: any, type: string, subtype: string, child?: boolea
         }
     }
     return newNode;
+}
+
+/**
+ * Serializes a custom component's script-scope `m` for a node that is changing owner.
+ *
+ * Node-valued entries are emitted as address references, not copies. Device-confirmed: `m` holds a
+ * *live* reference — mutating the referenced node on the receiving thread is visible through `m` —
+ * so a deep copy is both wrong (a detached snapshot that silently stops tracking) and expensive: a
+ * component caching `m.scene`/`m.parentScreen` dragged the whole scene tree into every payload,
+ * measured at 44 KB against 0.2 KB for the same node with scalar-only `m`.
+ * @param node Node whose `m` is being serialized.
+ * @param host Optional host node for observing context.
+ * @param visited Visited set of the enclosing pass.
+ * @returns The serialized `m` entries, excluding `top`/`global`.
+ */
+function serializeScriptScopeM(node: Node, host: Node | undefined, visited: WeakSet<object>): FlexObject {
+    const mData: FlexObject = {};
+    // Scoped so the values serialized here don't stay marked as visited: the enclosing pass may
+    // reach the same values by another route and must serialize them in full (see ScopedVisited).
+    const scoped = new ScopedVisited(visited);
+    const scopedVisited = scoped as unknown as WeakSet<object>;
+    try {
+        for (const [key, value] of node.m.elements) {
+            const lowerKey = key.toLowerCase();
+            if (lowerKey === "top" || lowerKey === "global") {
+                continue;
+            }
+            if (value instanceof Node) {
+                sgRoot.registerCrossThreadNode(value);
+                mData[key] = { _mref_: value.getAddress() };
+                continue;
+            }
+            mData[key] = jsValueOf(value, true, host, scopedVisited);
+        }
+    } finally {
+        scoped.rollback();
+    }
+    return mData;
+}
+
+/** One-shot warning when a script-scope node reference has no instance on the receiving thread. */
+let warnedUnresolvedScriptScopeRef = false;
+
+/**
+ * Merges a serialized script-scope `m` (see fromSGNode's `_m_` entry) into a node's `m`,
+ * preserving the locally built `top`/`global` entries. No-op for payloads without `_m_`.
+ * @param serializedM The serialized `_m_` object, if present.
+ * @param node Node whose `m` receives the entries.
+ * @param nodeMap Optional map tracking nodes by address for resolving circular references.
+ */
+function restoreScriptScopeM(serializedM: any, node: Node, nodeMap?: Map<string, Node>) {
+    if (!serializedM || typeof serializedM !== "object") {
+        return;
+    }
+    for (const [key, value] of Object.entries(serializedM)) {
+        const address: unknown = (value as FlexObject)?.["_mref_"];
+        if (typeof address === "string") {
+            // Resolve to this thread's own instance so `m` keeps referencing the live node.
+            const live = nodeMap?.get(address) ?? sgRoot.resolveLiveNode(address);
+            if (live) {
+                node.m.set(new BrsString(key), live, true);
+            } else if (!warnedUnresolvedScriptScopeRef) {
+                warnedUnresolvedScriptScopeRef = true;
+                BrsDevice.stderr.write(
+                    `warning,[sg] Dropped script-scope reference "${key}": the node it points at has not crossed to this thread`
+                );
+            }
+            continue;
+        }
+        node.m.set(new BrsString(key), brsValueOf(value, undefined, nodeMap), true);
+    }
+}
+
+/**
+ * Checks whether a node's `m` holds any script-scope entries beyond the automatic `top`/`global`.
+ * @param node Node to inspect.
+ * @returns True when `m` was populated (locally or by a previous restore).
+ */
+function hasScriptScopeM(node: Node): boolean {
+    for (const key of node.m.elements.keys()) {
+        const lowerKey = key.toLowerCase();
+        if (lowerKey !== "top" && lowerKey !== "global") {
+            return true;
+        }
+    }
+    return false;
 }
 
 /**
@@ -339,6 +710,7 @@ export function updateSGNode(obj: any, targetNode: Node, nodeMap?: Map<string, N
     targetNode.setOwner(obj["_owner_"] ?? targetNode.getOwner());
     // Register/update in nodeMap
     nodeMap.set(targetNode.getAddress(), targetNode);
+    sgRoot.registerCrossThreadNode(targetNode);
     // Update fields
     const fieldTypes = obj["_fieldtypes_"] ?? {};
     for (const key in obj) {
@@ -371,6 +743,12 @@ export function updateSGNode(obj: any, targetNode: Node, nodeMap?: Map<string, N
         if (!(key in obj)) {
             targetNode.setValueSilent(key, BrsInvalid.Instance, undefined, FieldKind.fromString(fieldTypes[key]));
         }
+    }
+    // Populate script-scope `m` only when the target never had one (a flat-created cross-thread
+    // copy holding just top/global): a locally populated `m` is authoritative and must not be
+    // clobbered by a stale copy from the other thread.
+    if (!hasScriptScopeM(targetNode)) {
+        restoreScriptScopeM(obj["_m_"], targetNode, nodeMap);
     }
     // Update children
     const serializedChildren = obj["_children_"];
@@ -447,6 +825,70 @@ export function updateSGNode(obj: any, targetNode: Node, nodeMap?: Map<string, N
     return targetNode;
 }
 
+/** Options controlling how a node is serialized for another thread. */
+export interface SerializeOptions {
+    /**
+     * Include the node's script-scope `m` (`_m_`). Only correct for an ownership transfer — a node
+     * keeping its owner is read back through a rendezvous to that owner, whose `m` is authoritative.
+     */
+    scriptScope?: boolean;
+    /**
+     * Emit this node's node-valued fields as address-only proxy references instead of recursing
+     * into them. Applies to the node's own fields only, not to anything nested below them.
+     */
+    shallowRefs?: boolean;
+}
+
+/**
+ * Serializes a node as an address-only reference: enough for the receiving thread to hold it and
+ * rendezvous to the owner on access, without shipping its subtree.
+ *
+ * The stub is flagged `_proxy_` so the rebuilt node knows its field list is incomplete. Normally
+ * the first read of the field holding it rendezvouses and replaces the stub with a full copy, but
+ * in `fastFieldReads` mode that read can be served from the local cache and hand the stub itself
+ * to the app — at which point a read of any field on it must still reach the owner rather than
+ * answer `invalid`.
+ * @param node Node to reference.
+ * @returns A minimal serialized node stub: type, address, owner, and the proxy flag.
+ */
+export function proxyNodeRef(node: Node): FlexObject {
+    // Keep it resolvable by address on the owner thread so the rendezvous read can find it.
+    sgRoot.registerCrossThreadNode(node);
+    return {
+        _node_: `${node.nodeType}:${node.nodeSubtype}`,
+        _address_: node.getAddress(),
+        _owner_: node.getOwner(),
+        _proxy_: true,
+    };
+}
+
+/**
+ * Serializes a Task node's script-scope `m` for launch, shipping the render-owned `global` node
+ * with its node-valued fields as proxy references instead of deep copies.
+ *
+ * On a device `m.global` is shared; here every Task worker gets a copy, and apps keep most of their
+ * state as node-valued global fields (managers, config, caches), so a deep copy made each Task
+ * payload carry the whole global tree — a dominant memory cost when many tasks run at once. Those
+ * fields rendezvous on read from a Task anyway (`Node.get`), which materializes the real value on
+ * first access, so the launch payload only has to carry the reference. `m.top` and every other
+ * entry stay deep: the task owns them and reads them locally.
+ * @param m The Task node's script-scope `m`.
+ * @param host The Task node (observer context for serialization).
+ * @returns The serialized `m`, with `global` shallow-referenced.
+ */
+export function serializeTaskM(m: RoAssociativeArray, host: Node): FlexObject {
+    const visited = new WeakSet<object>();
+    const result: FlexObject = {};
+    for (const [key, value] of m.elements) {
+        if (key.toLowerCase() === "global" && value instanceof Node) {
+            result[key] = fromSGNode(value, true, host, visited, { shallowRefs: true });
+        } else {
+            result[key] = jsValueOf(value, true, host, visited);
+        }
+    }
+    return result;
+}
+
 /**
  * Converts a RoSGNode to a JavaScript object, converting each field to the corresponding JavaScript type.
  * @param node The RoSGNode to convert.
@@ -455,7 +897,14 @@ export function updateSGNode(obj: any, targetNode: Node, nodeMap?: Map<string, N
  * @param visited Optional WeakSet to track visited nodes and prevent circular references.
  * @returns A JavaScript object with the converted fields.
  */
-export function fromSGNode(node: Node, deep: boolean = true, host?: Node, visited?: WeakSet<object>): FlexObject {
+export function fromSGNode(
+    node: Node,
+    deep: boolean = true,
+    host?: Node,
+    visited?: WeakSet<object>,
+    options: SerializeOptions = {}
+): FlexObject {
+    const scriptScope = options.scriptScope ?? false;
     visited ??= new WeakSet<object>();
     if (visited.has(node)) {
         return {
@@ -464,6 +913,9 @@ export function fromSGNode(node: Node, deep: boolean = true, host?: Node, visite
         };
     }
     visited.add(node);
+    // A serialized node's address may be used by the other thread to rendezvous back into this
+    // one long after the local trees stopped referencing it — keep it resolvable by address.
+    sgRoot.registerCrossThreadNode(node);
 
     const result: FlexObject = {};
     const fields = node.getNodeFields();
@@ -490,7 +942,9 @@ export function fromSGNode(node: Node, deep: boolean = true, host?: Node, visite
                 }
             }
             if (fieldValue instanceof Node) {
-                result[name] = fromSGNode(fieldValue, deep, host, visited);
+                result[name] = options.shallowRefs
+                    ? proxyNodeRef(fieldValue)
+                    : fromSGNode(fieldValue, deep, host, visited, { scriptScope });
                 continue;
             }
             const serialized = jsValueOf(fieldValue, deep, host, visited);
@@ -508,17 +962,132 @@ export function fromSGNode(node: Node, deep: boolean = true, host?: Node, visite
     if (observed.length) {
         result["_observed_"] = observed;
     }
+    // A custom component's script-scope `m` (populated by its init() on the owning thread) must
+    // travel with the node: the receiving thread rebuilds the node without running init(), so a
+    // callFunc there would otherwise read init()-set variables back as invalid. `top`/`global`
+    // are excluded — the receiver rebuilds them locally, and serializing them here would re-walk
+    // the node and ship the entire global tree.
+    if (deep && scriptScope && sgRoot.nodeDefMap.has(node.nodeSubtype.toLowerCase())) {
+        const mData = serializeScriptScopeM(node, host, visited);
+        if (Object.keys(mData).length) {
+            result["_m_"] = mData;
+        }
+    }
     const children = node.getNodeChildren();
-    if (deep && children.length > 0) {
+    if (deep && children.length > 0 && node.serializesChildren()) {
         result["_children_"] = children.map((child: BrsType) => {
             if (child instanceof Node) {
-                return fromSGNode(child, deep, host, visited);
+                return fromSGNode(child, deep, host, visited, { scriptScope });
             }
             return { _invalid_: null };
         });
     }
 
     return result;
+}
+
+/** Serialized form of a roSGNodeEvent queued on a task's port before the task thread launched. */
+export interface SerializedPortEvent {
+    /** Address of the node the event originated from. */
+    node: string;
+    field: string;
+    value: any;
+    info?: any;
+}
+
+/**
+ * Drains the roSGNodeEvents queued on message ports held directly by a task's `m` and serializes
+ * them for the launching task thread. On a device the task's copied `m` references the same native
+ * port, so events queued before `control = "RUN"` (e.g. a field set right before launch, observed
+ * by the port in init()) are seen by the task function's wait(); the simulator must carry them
+ * across explicitly or the task blocks forever on a wait for an event that already fired.
+ * @param m The task node's script-scope `m`.
+ * @param host The task node (observer context for value serialization).
+ * @returns Events keyed by the `m` entry holding the port, or undefined when none are queued.
+ */
+export function collectPortNodeEvents(
+    m: RoAssociativeArray,
+    host: Node
+): Record<string, SerializedPortEvent[]> | undefined {
+    let result: Record<string, SerializedPortEvent[]> | undefined;
+    for (const [key, value] of m.elements) {
+        if (!(value instanceof RoMessagePort)) {
+            continue;
+        }
+        const events = value.drainMessages((event) => event instanceof RoSGNodeEvent) as RoSGNodeEvent[];
+        if (events.length === 0) {
+            continue;
+        }
+        result ??= {};
+        result[key] = events.map((event) => ({
+            node: event.node.getAddress(),
+            field: event.fieldName.getValue(),
+            value: jsValueOf(event.fieldValue, true, host),
+            info: event.infoFields ? fromAssociativeArray(event.infoFields, true, host) : undefined,
+        }));
+    }
+    return result;
+}
+
+/**
+ * Discards the node events queued on a task's render-side ports. While a task runs, field changes
+ * reach it live (the render thread pushes to the observing task), yet the render-side copy of the
+ * port keeps queueing the same events and nothing consumes them. Dropping them when the task stops
+ * keeps a restart replaying only what was queued while it was stopped — otherwise a stop/run cycle
+ * (the standard polling-task pattern) would replay the whole previous run's backlog at once.
+ * @param m The task node's script-scope `m`.
+ */
+export function dropPortNodeEvents(m: RoAssociativeArray): void {
+    for (const value of m.elements.values()) {
+        if (value instanceof RoMessagePort) {
+            value.drainMessages((event) => event instanceof RoSGNodeEvent);
+        }
+    }
+}
+
+/** One-shot warning when a pre-launch port event can't be re-targeted on the task thread. */
+let warnedUnresolvedPortEvent = false;
+
+/**
+ * Replays pre-launch port events (see `collectPortNodeEvents`) into the task thread's restored
+ * ports, re-targeting each event's node to its task-side instance. Events from nodes other than
+ * the task node or the global node can't be resolved this early and are dropped with a warning.
+ * @param portEvents Serialized events keyed by the `m` entry holding the port.
+ * @param m The task-side `m` holding the restored ports.
+ * @param taskNode The task node on the task thread.
+ * @param globalNode The task thread's global node.
+ */
+export function replayPortNodeEvents(
+    portEvents: Record<string, SerializedPortEvent[]>,
+    m: RoAssociativeArray,
+    taskNode: Node,
+    globalNode: Node
+): void {
+    for (const [key, events] of Object.entries(portEvents)) {
+        const port = m.get(new BrsString(key));
+        if (!(port instanceof RoMessagePort)) {
+            continue;
+        }
+        for (const event of events) {
+            let target: Node | undefined;
+            if (event.node === taskNode.getAddress()) {
+                target = taskNode;
+            } else if (event.node === globalNode.getAddress()) {
+                target = globalNode;
+            }
+            if (!target) {
+                if (!warnedUnresolvedPortEvent) {
+                    warnedUnresolvedPortEvent = true;
+                    BrsDevice.stderr.write(
+                        `warning,[sg] Dropped pre-launch port event for field "${event.field}": source node not available on the task thread`
+                    );
+                }
+                continue;
+            }
+            const info = event.info ? (brsValueOf(event.info) as RoAssociativeArray) : undefined;
+            port.pushMessage(new RoSGNodeEvent(target, new BrsString(event.field), brsValueOf(event.value), info));
+        }
+    }
 }
 
 /**

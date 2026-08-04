@@ -4,7 +4,7 @@ const scenegraph = require("../../../packages/scenegraph/lib/brs-sg.node.js");
 const core = require("../../../packages/node/bin/brs.node.js");
 
 const { SGNodeFactory, sgRoot, getBrsValueFromFieldType } = scenegraph;
-const { BrsDevice, BrsString, Int32, RoArray } = core;
+const { BrsDevice, BrsString, Int32, Float, RoArray } = core;
 
 /**
  * Builds a root → rows → items ContentNode tree.
@@ -42,11 +42,88 @@ describe("RowList key handling", () => {
         const list = SGNodeFactory.createNode("RowList");
         list.setValue("vertFocusAnimationStyle", new BrsString("fixedFocusWrap"));
         list.setValue("content", buildContent([["A", "B"]]));
+        // Focus the list before driving keys: on a real device a list handles up/down only while
+        // focused, and itemFocused fires (index 0) on that focus-gain. Loading content into an
+        // unfocused list does not move focus, so itemFocused would otherwise stay at its sentinel.
+        list.setNodeFocus(true);
 
         expect(list.handleKey("down", true)).toBe(false);
         expect(list.handleKey("up", true)).toBe(false);
         // Focus row is unchanged because no move happened.
         expect(list.getValueJS("itemFocused")).toBe(0);
+    });
+
+    test("currFocusRow/currFocusColumn track the focused item on horizontal and vertical navigation", () => {
+        // Regression: currFocusRow/currFocusColumn (inherited ArrayGrid fields) were declared but never
+        // written, so they stayed pinned at their 0.0 default. Apps that observe/alias them to drive a
+        // focused-item overlay (e.g. a home-screen metadata/poster panel) never left item [0, 0]. They
+        // must mirror rowItemFocused as focus moves.
+        const list = SGNodeFactory.createNode("RowList");
+        list.setValue("content", buildContent([["A", "B", "C"], ["D", "E"], ["F"]]));
+
+        // Fresh list: focus at [0, 0].
+        expect(list.getValueJS("currFocusRow")).toBe(0);
+        expect(list.getValueJS("currFocusColumn")).toBe(0);
+
+        // Horizontal move within row 0 updates the column (row stays 0).
+        list.handleKey("right", true);
+        expect(list.getValueJS("currFocusRow")).toBe(0);
+        expect(list.getValueJS("currFocusColumn")).toBe(1);
+        expect(list.getValueJS("rowItemFocused")).toEqual([0, 1]);
+
+        // Vertical move to row 1 updates the row.
+        list.handleKey("down", true);
+        expect(list.getValueJS("currFocusRow")).toBe(1);
+        expect(list.getValueJS("rowItemFocused")[0]).toBe(1);
+
+        // A programmatic jumpToRowItem also syncs both fields.
+        list.setValue("jumpToRowItem", new RoArray([new Int32(2), new Int32(0)]));
+        expect(list.getValueJS("currFocusRow")).toBe(2);
+        expect(list.getValueJS("currFocusColumn")).toBe(0);
+    });
+
+    test("vertical nav emits vertFocusDirection (then resets to none) and settles rowItemFocused last", () => {
+        // Regression: an app that positions a per-row overlay reads the vertical scroll direction from
+        // vertFocusDirection and treats the rowItemFocused observer as the authoritative "settled"
+        // callback. (1) vertFocusDirection must report up/down during the move and reset to "none"
+        // afterward; (2) currFocusRow must be emitted BEFORE rowItemFocused so the settle notification
+        // fires last (an observer on rowItemFocused must already see the final row).
+        const { RoMessagePort } = core;
+        const fakeInterpreter = { environment: {}, inSubEnv: () => {} };
+        const list = SGNodeFactory.createNode("RowList");
+        list.setValue("content", buildContent([["A", "B"], ["C", "D"], ["E"]]));
+        // Focus the list: itemFocused/rowItemFocused/currFocusRow notify observers only while the
+        // list is in the focus chain (a real device only navigates a focused list). Without focus
+        // the focus fields update silently and no observer notification is emitted.
+        list.setNodeFocus(true);
+
+        // Capture the order of focus-field notifications across one vertical move.
+        const port = new RoMessagePort();
+        const order = [];
+        const originalPush = port.pushMessage.bind(port);
+        port.pushMessage = (event) => {
+            order.push(event.fieldName ? event.fieldName.getValue() : "");
+            originalPush(event);
+        };
+        list.addObserver(fakeInterpreter, "unscoped", new BrsString("currFocusRow"), port);
+        list.addObserver(fakeInterpreter, "unscoped", new BrsString("rowItemFocused"), port);
+
+        list.handleKey("down", true);
+
+        // Down moved to row 1 and the direction settled back to none.
+        expect(list.getValueJS("rowItemFocused")[0]).toBe(1);
+        expect(list.getValueJS("vertFocusDirection")).toBe("none");
+
+        // currFocusRow was notified before rowItemFocused (settle fires last).
+        const rowIdx = order.indexOf("currFocusRow");
+        const itemIdx = order.lastIndexOf("rowItemFocused");
+        expect(rowIdx).toBeGreaterThanOrEqual(0);
+        expect(itemIdx).toBeGreaterThan(rowIdx);
+
+        // Up reports the opposite direction, then resets.
+        list.handleKey("up", true);
+        expect(list.getValueJS("rowItemFocused")[0]).toBe(0);
+        expect(list.getValueJS("vertFocusDirection")).toBe("none");
     });
 
     test("a multi-row fixedFocusWrap list still wraps (down/up stay handled)", () => {
@@ -424,5 +501,279 @@ describe("RowList key handling", () => {
         // and preserving the natural 23px gap (rowHeight 220 - poster 197) below it.
         expect(row1.y).toBe(220 + band);
         expect(row1.y - (row0.y + row0.h)).toBe(220 - 197);
+    });
+
+    test("a cached item is resized when rowItemSize is applied after its first render (regression: stretched first item)", () => {
+        // Regression: a RowList that declares a near-full-width `itemSize` fallback and only assigns
+        // the real per-item `rowItemSize` later at runtime. Item [0] is created on an early render
+        // pass while the width is still the full-row fallback; its width/height used to be set only
+        // at creation time and never re-applied, so the first item stayed frozen at full row width
+        // while later items sized correctly.
+        const list = SGNodeFactory.createNode("RowList");
+        list.setValue("numRows", new Int32(1));
+        // itemSize is the (wide) fallback width used until the app assigns rowItemSize; no
+        // rowItemSize yet, so getRowItemSize falls back to itemSize and item [0] is created wide.
+        list.setValue("itemSize", new RoArray([new Float(600), new Float(350)]));
+        list.setValue("content", buildContent([["A", "B"]]));
+
+        // First render creates item [0] with the fallback (full-width) size.
+        list.renderNode({}, [0, 0], 0, 1);
+        const item0 = list.rowItemComps[0][0];
+        expect(item0.getValueJS("width")).toBe(600);
+
+        // The app now assigns the real per-item size and re-renders. The SAME cached item must be
+        // resized to the per-item width, not stay frozen at the full-row fallback.
+        list.setValue("rowItemSize", new RoArray([new RoArray([new Float(310), new Float(442)])]));
+        list.renderNode({}, [0, 0], 0, 1);
+        expect(list.rowItemComps[0][0]).toBe(item0);
+        expect(item0.getValueJS("width")).toBe(310);
+        expect(item0.getValueJS("height")).toBe(442);
+    });
+
+    test("itemHasFocus is false until the list itself has focus (focused column alone is not enough)", () => {
+        // Regression: a button focused on the first render did not show its focused
+        // state once the list gained focus afterwards. itemHasFocus was set from the focused COLUMN
+        // only, so it stayed true and never transitioned when the list's focus changed — the item's
+        // itemHasFocus observer (which drives the focused background) therefore never re-fired. Per the
+        // RowList reference, itemHasFocus must be false while the list is unfocused, and become true
+        // (a real change → observers fire) when the list gains focus.
+        const list = SGNodeFactory.createNode("RowList");
+        list.setValue("numRows", new Int32(1));
+        list.setValue("itemSize", new RoArray([new Float(1280), new Float(72)]));
+        list.setValue("rowHeights", new RoArray([new Float(72)]));
+        list.setValue("rowItemSize", new RoArray([new RoArray([new Float(200), new Float(72)])]));
+        list.setValue("content", buildContent([["A", "B"]]));
+
+        // Unfocused list: the focused column's item still reports itemHasFocus=false.
+        list.renderNode({}, [0, 0], 0, 1);
+        const item0 = list.rowItemComps[0][0];
+        expect(item0.getValueJS("itemHasFocus")).toBe(false);
+
+        // Give the list focus and render again: the same item now has focus (a false→true change).
+        sgRoot.setFocused(list);
+        list.renderNode({}, [0, 0], 0, 1);
+        expect(item0.getValueJS("itemHasFocus")).toBe(true);
+        expect(item0.getValueJS("rowListHasFocus")).toBe(true);
+    });
+
+    test("a focused list with no content does not consume (or crash on) directional keys", () => {
+        // Regression: pressing left/right on a focused RowList whose content is empty threw
+        // "Cannot read properties of undefined (reading 'getNodeChildren')" — handleLeftRight looked up
+        // this.content[focusIndex] (undefined, because the content view is empty while the focus cursor
+        // still reads 0) and passed it straight to getContentChildren. The exception escaped to the
+        // message loop and killed the app. A real device just leaves the key unhandled so it bubbles to
+        // the parent (which is how an empty screen still navigates back to its menu).
+        // Both empty shapes: content never assigned, and an assigned-but-empty tree (the app loaded an
+        // empty result set — e.g. a favorites screen with no entries).
+        const unassigned = SGNodeFactory.createNode("RowList");
+        const emptyTree = SGNodeFactory.createNode("RowList");
+        emptyTree.setValue("content", buildContent([]));
+
+        for (const list of [unassigned, emptyTree]) {
+            list.setNodeFocus(true);
+            for (const key of ["left", "right", "up", "down", "rewind", "fastforward", "OK"]) {
+                expect(list.handleKey(key, true)).toBe(false);
+                expect(list.handleKey(key, false)).toBe(false);
+            }
+            list.setNodeFocus(false);
+        }
+    });
+});
+
+/**
+ * Vertical scrolling must follow `vertFocusAnimationStyle`. Per Roku, fixedFocus/fixedFocusWrap pin the
+ * focused row at the list top and scroll the rows above it off screen; floatingFocus keeps rows at fixed
+ * positions and only scrolls "if there are rows that were not visible" — so a list whose `numRows` covers
+ * the whole content never scrolls internally at all. RowList used to apply the fixedFocus rule to every
+ * style, shifting the whole grid up a full row pitch per Up/Down even when every row already fit. Apps
+ * that do their own scrolling by translating the RowList node (with numRows == rowCount precisely to
+ * disable internal scrolling) got double the intended travel, pushing the focused row off the top.
+ */
+describe("RowList vertical scrolling honors vertFocusAnimationStyle", () => {
+    beforeAll(() => {
+        const commonZip = fs.readFileSync(path.join(__dirname, "../../../packages/scenegraph/assets/common.zip"));
+        BrsDevice.fileSystem.setup(commonZip.buffer, new ArrayBuffer(1024 * 1024), new ArrayBuffer(1024 * 1024));
+    });
+
+    afterEach(() => {
+        sgRoot.setFocused();
+    });
+
+    // Rows small enough that all of them fit inside the default scene height, so a row that is missing
+    // from a render was genuinely scrolled away rather than merely off the bottom edge.
+    const ROW_HEIGHT = 80;
+    const ROW_SPACING = 20;
+    const PITCH = ROW_HEIGHT + ROW_SPACING;
+
+    /**
+     * A list of `rowCount` single-item rows (one item per row, so a row index maps to one title),
+     * instrumented to record the y-origin each row's item component is drawn at. Item components are
+     * cached across renders, so the recording wrapper is installed at creation time — before the list
+     * is focused, which itself builds the focused row's component.
+     */
+    function makeList(rowCount, style, numRows) {
+        const list = SGNodeFactory.createNode("RowList");
+        const rows = [];
+        for (let i = 0; i < rowCount; i++) {
+            rows.push(["R" + i]);
+        }
+        const drawn = {};
+        const original = list.createItemComponent.bind(list);
+        list.createItemComponent = (interp, itemRect, content) => {
+            const comp = original(interp, itemRect, content);
+            const render = comp.renderNode.bind(comp);
+            comp.renderNode = (i2, origin, angle, opacity, draw2D) => {
+                drawn[content.getValueJS("title")] = Math.round(origin[1]);
+                return render(i2, origin, angle, opacity, draw2D);
+            };
+            return comp;
+        };
+
+        list.setValue("vertFocusAnimationStyle", new BrsString(style));
+        list.setValue("content", buildContent(rows));
+        list.setValue("itemSize", new RoArray([new Int32(1280), new Int32(ROW_HEIGHT)]));
+        // Items narrower than the row (and the scene) so every row's single item fits without the
+        // horizontal scroll path kicking in — this suite is only about VERTICAL positioning.
+        list.setValue("rowItemSize", new RoArray([new RoArray([new Int32(300), new Int32(ROW_HEIGHT)])]));
+        list.setValue("itemSpacing", new RoArray([new Int32(0), new Int32(ROW_SPACING)]));
+        list.setValue("numRows", new Int32(numRows));
+        list.setNodeFocus(true);
+
+        list.renderRows = () => {
+            for (const key of Object.keys(drawn)) {
+                delete drawn[key];
+            }
+            list.renderNode({}, [0, 0], 0, 1);
+            return { ...drawn };
+        };
+        return list;
+    }
+
+    test("floatingFocus with numRows == rowCount never scrolls internally", () => {
+        // The shape an app uses when it scrolls by translating the RowList itself: every row is
+        // "visible", so the list must keep each row pinned at its own fixed position no matter which
+        // row holds focus. Row N stays at N * (rowHeight + itemSpacing.y).
+        const list = makeList(5, "floatingFocus", 5);
+        for (let row = 0; row < 5; row++) {
+            if (row > 0) {
+                expect(list.handleKey("down", true)).toBe(true);
+            }
+            expect(list.getValueJS("itemFocused")).toBe(row);
+
+            const drawn = list.renderRows();
+            // Every row is still drawn, each at its own unchanging position.
+            for (let i = 0; i < 5; i++) {
+                expect(drawn["R" + i]).toBe(i * PITCH);
+            }
+            expect(list.topRow).toBe(0);
+        }
+    });
+
+    test("floatingFocus with numRows < rowCount scrolls only once focus leaves the window", () => {
+        // 5 rows, a 3-row window: rows 0-2 need no scroll, then the window follows focus down and
+        // clamps at the bottom (topRow max = rowCount - numRows).
+        const list = makeList(5, "floatingFocus", 3);
+
+        expect(list.topRow).toBe(0);
+        list.renderRows();
+        expect(list.topRow).toBe(0);
+
+        // Down to rows 1 and 2 — still inside the window, so the top row does not move.
+        for (const expected of [1, 2]) {
+            list.handleKey("down", true);
+            list.renderRows();
+            expect(list.getValueJS("itemFocused")).toBe(expected);
+            expect(list.topRow).toBe(0);
+        }
+
+        // Row 3 falls past the last visible slot, so the window advances by exactly one row.
+        list.handleKey("down", true);
+        const drawn = list.renderRows();
+        expect(list.topRow).toBe(1);
+        expect(drawn["R0"]).toBeUndefined(); // row 0 scrolled off the top
+        expect(drawn["R1"]).toBe(0);
+
+        // Row 4 advances it once more, and there it clamps (5 rows - 3 visible).
+        list.handleKey("down", true);
+        list.renderRows();
+        expect(list.topRow).toBe(2);
+
+        // Coming back up, the window only moves once focus leaves it at the top.
+        list.handleKey("up", true);
+        list.renderRows();
+        expect(list.topRow).toBe(2);
+        list.handleKey("up", true);
+        list.renderRows();
+        expect(list.topRow).toBe(2);
+        list.handleKey("up", true);
+        list.renderRows();
+        expect(list.getValueJS("itemFocused")).toBe(1);
+        expect(list.topRow).toBe(1);
+    });
+
+    test("fixedFocus (the RowList default) still pins the focused row at the list top", () => {
+        // Pins the pre-existing behavior for every app that does not ask for floatingFocus.
+        const list = makeList(5, "fixedFocus", 5);
+
+        let drawn = list.renderRows();
+        expect(drawn["R0"]).toBe(0);
+
+        list.handleKey("down", true);
+        drawn = list.renderRows();
+        // The focused row is drawn at the list's top and the row above it is gone.
+        expect(drawn["R1"]).toBe(0);
+        expect(drawn["R0"]).toBeUndefined();
+    });
+
+    test("rows scrolled entirely above the viewport do not abort the pass", () => {
+        // An app that scrolls by translating the list itself parks the earlier rows off the TOP of the
+        // screen. The render loop used to stop at the first row that did not intersect the scene — safe
+        // only while the pass always began at the focused (on-screen) row. Starting at the window's top
+        // row instead, a full row of clearance above the viewport aborted the pass before reaching the
+        // focused row, blanking it and everything below it (the last row of a detail panel vanished
+        // while it still navigated normally).
+        const list = makeList(4, "floatingFocus", 4);
+        const bottomRow = 3;
+        list.setValue("jumpToRowItem", new RoArray([new Int32(bottomRow), new Int32(0)]));
+
+        // Translate so row 1 clears the top of the screen entirely, leaving the focused row on screen.
+        const listY = -(2 * PITCH + 10);
+        list.setValue("translation", new RoArray([new Int32(0), new Int32(listY)]));
+        expect(listY + PITCH + ROW_HEIGHT).toBeLessThan(0); // row 1 is fully above the viewport
+
+        const drawn = list.renderRows();
+        // Every row is still laid out at its own fixed position, focused row included.
+        for (let i = 0; i < 4; i++) {
+            expect(drawn["R" + i]).toBe(listY + i * PITCH);
+        }
+        expect(drawn["R" + bottomRow]).toBeGreaterThanOrEqual(0); // and it is genuinely on screen
+    });
+
+    test("the pass still stops at the first row below the viewport", () => {
+        // The early-out that keeps a long list from rendering rows nobody can see must survive: with the
+        // list at the top of the screen, only the rows that fit are drawn.
+        const list = makeList(40, "floatingFocus", 40);
+        list.setValue("translation", new RoArray([new Int32(0), new Int32(0)]));
+
+        const drawn = list.renderRows();
+        const sceneBottom = list.sceneRect.y + list.sceneRect.height;
+        const rendered = Object.keys(drawn).length;
+        expect(rendered).toBeGreaterThan(0);
+        expect(rendered).toBeLessThan(40);
+        // Nothing was drawn starting past the bottom edge.
+        for (const y of Object.values(drawn)) {
+            expect(y).toBeLessThan(sceneBottom);
+        }
+    });
+
+    test("a fresh RowList's cached vertical focus style matches its fixedFocus field default", () => {
+        // ArrayGrid's constructor caches the style while the field still holds ArrayGrid's own
+        // floatingFocus default; RowList's fixedFocus default is installed afterwards via
+        // registerDefaultFields, which bypasses setValue. The two used to disagree, so a RowList that
+        // never touched the field reported floatingFocus internally while reading fixedFocus back.
+        const list = SGNodeFactory.createNode("RowList");
+        expect(list.getValueJS("vertFocusAnimationStyle")).toBe("fixedFocus");
+        expect(list.isFixedFocusMode()).toBe(true);
+        expect(list.wrap).toBe(false);
     });
 });

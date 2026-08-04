@@ -11,7 +11,7 @@ import {
     BrsInvalid,
 } from "brs-engine";
 import { Node } from "./Node";
-import type { Field } from "./Field";
+import { Field } from "./Field";
 import { FieldKind, FieldModel } from "../SGTypes";
 import { SGNodeType } from ".";
 import { sgRoot } from "../SGRoot";
@@ -102,7 +102,7 @@ export class ContentNode extends Node {
         { name: "streamUrls", type: "stringarray", hidden: true },
         { name: "subtitleColor", type: "string", hidden: true },
         { name: "subtitleConfig", type: "assocarray", hidden: true },
-        { name: "subtitleTracks", type: "assocarray", hidden: true },
+        { name: "subtitleTracks", type: "array", hidden: true },
         { name: "subtitleUrl", type: "string", hidden: true },
         { name: "switchingStrategy", type: "string", hidden: true },
         { name: "targetRect", type: "assocarray", hidden: true },
@@ -114,6 +114,7 @@ export class ContentNode extends Node {
         { name: "textOverlayUL", type: "string", hidden: true },
         { name: "textOverlayUR", type: "string", hidden: true },
         { name: "title", type: "string", hidden: true },
+        { name: "secondaryTitle", type: "string", hidden: true }, // Introduced in OS 11.5
         { name: "titleSeason", type: "string", hidden: true },
         { name: "trackIDAudio", type: "string", hidden: true },
         { name: "trackIDSubtitle", type: "string", hidden: true },
@@ -178,7 +179,20 @@ export class ContentNode extends Node {
         let appendedIndex: number | null = null;
         if (child instanceof ContentNode) {
             success = true;
-            if (!this.children.includes(child)) {
+            const existingIndex = this.children.indexOf(child);
+            if (existingIndex >= 0) {
+                // Re-appending an existing child MOVES it to the end (device behavior): apps
+                // reorder list content this way — e.g. append a new entry, then re-append an
+                // existing one so it becomes the last option.
+                if (existingIndex !== this.children.length - 1) {
+                    this.children.splice(existingIndex, 1);
+                    this.recordChildChange("remove", existingIndex, existingIndex);
+                    appendedIndex = this.children.length;
+                    this.children.push(child);
+                    added = true;
+                }
+            } else {
+                this.detachFromCurrentParent(child);
                 appendedIndex = this.children.length;
                 this.children.push(child);
                 child.setNodeParent(this);
@@ -205,17 +219,31 @@ export class ContentNode extends Node {
      * to changes within their content. Guarded against re-entry on the same node: an observer
      * that mutates this same ContentNode would otherwise re-trigger propagation synchronously
      * and overflow the call stack (see {@link propagating}).
+     *
+     * Notification also crosses thread boundaries. On a device the parent field's port observer is
+     * the *same* native port the task is waiting on, so mutating content held by an observed field
+     * wakes that task no matter which thread performed the mutation. Here the task holds its own
+     * copy of the node, so the render thread has to push the change over — the same fan-out
+     * `Node.setValue` performs, which this path bypasses because it starts from a field rather than
+     * from the node that holds it.
      */
     private notifyParentFields() {
         if (this.propagating || this.parentFields.size === 0) {
             return;
         }
         this.propagating = true;
+        // Mark this as a ContentNode parentField cascade so its observers dispatch synchronously
+        // (inline) rather than being deferred — the #904/#905/#943 termination guards rely on it.
+        Field.enterParentCascade();
         try {
             for (const field of this.parentFields) {
                 field.notifyObservers();
+                // No-op off the render thread and when no task port-observes the field, so a purely
+                // local content update pays only the (short) walk over the active task list.
+                field.getContainer()?.fanOutFieldToObservingTasks(field.getName().toLowerCase());
             }
         } finally {
+            Field.exitParentCascade();
             this.propagating = false;
         }
     }
@@ -352,13 +380,23 @@ export class ContentNode extends Node {
      */
     protected makeDirty() {
         this.changed = true;
+        this.markSubtreeStale();
         // Propagate the dirty flag up to the content root so an ancestor ArrayGrid/TimeGrid
         // re-parses its model when a descendant ContentNode changes. This must happen on any
         // thread — in particular for mutations applied on the render thread on behalf of a Task
         // (rendezvous), where inTaskThread() is false but the parent grid still needs to refresh.
-        if (this.parent instanceof Node) {
-            const root = this.findRootNode();
-            root.changed = true;
+        // A content tree hangs off a FIELD (it is not parented into the render tree), so the
+        // stale walk above never reaches the render node consuming it — hop through the root's
+        // parent fields to their containers (the grid/label holding the content) so a pruned
+        // layout refresh re-descends into that consumer.
+        const root = this.parent instanceof Node ? this.findRootNode() : this;
+        root.changed = true;
+        // parentFields may be undefined here: the base Node constructor writes fields
+        // (setValueSilent → makeDirty) before this subclass's field initializers run.
+        if (root instanceof ContentNode && root.parentFields) {
+            for (const field of root.parentFields) {
+                field.getContainer()?.markSubtreeStale();
+            }
         }
         sgRoot.makeDirty();
     }

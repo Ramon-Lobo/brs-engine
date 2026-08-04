@@ -215,21 +215,36 @@ export class RoSGScreen extends BrsComponent implements BrsValue, BrsDraw2D {
                     sgRoot.clearDirty();
                     sgRoot.rendering = true;
                     try {
-                        sgRoot.scene.renderNode(interpreter, [0, 0], 0, 1, this.draw2D);
+                        sgRoot.scene.paintNode(interpreter, [0, 0], 0, 1, this.draw2D);
                         if (showDialog) {
                             const dialog = sgRoot.scene.dialog!;
                             dialog.setValueSilent("visible", BrsBoolean.True);
                             const screenRect = { x: 0, y: 0, width: this.width, height: this.height };
                             this.draw2D.doDrawRotatedRect(screenRect, 255, 0, [0, 0], 0.5);
-                            dialog.renderNode(interpreter, [0, 0], 0, 1, this.draw2D);
+                            dialog.paintNode(interpreter, [0, 0], 0, 1, this.draw2D);
                         }
                     } finally {
                         sgRoot.rendering = false;
+                        // Frame-level backstop for the clip stack. Individual clips are bracketed with
+                        // try/finally, but an error escaping arbitrary BrightScript (an item
+                        // component's init(), a field observer) can unwind past a bracket that has not
+                        // been entered yet. A leaked clip is permanent canvas state, so without this
+                        // one bad frame would silently clip every frame after it.
+                        this.draw2D.resetClips();
                     }
                 }
-                // Limited FPS enforcement
+                // Limited FPS enforcement - caps redraw cadence only. Keep polling timers during
+                // the wait so near-zero-duration Timer nodes (e.g. the promise library's
+                // "essentially next tick" scheduling) fire as soon as they're due instead of being
+                // held hostage to a full frame period. Per the Roku docs, `duration` supports
+                // millisecond granularity and `fire` observers run on the render thread (not tied
+                // to draw cadence), and multi-hop Timer chains measurably don't accumulate this
+                // per-hop frame-period latency on a real device.
                 let timeStamp = Date.now();
                 while (timeStamp - this.lastMessage < this.maxMs) {
+                    if (sgRoot.processTimers()) {
+                        this.isDirty = true;
+                    }
                     timeStamp = Date.now();
                 }
                 this.finishDraw();
@@ -327,6 +342,7 @@ export class RoSGScreen extends BrsComponent implements BrsValue, BrsDraw2D {
             returns: ValueKind.Void,
         },
         impl: (_: Interpreter) => {
+            BrsDevice.resetKeysBuffer();
             this.port?.pushMessage(new RoSGScreenEvent(BrsBoolean.True));
             return Uninitialized.Instance;
         },
