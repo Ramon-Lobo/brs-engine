@@ -1,0 +1,5 @@
+integer_after_invalid|0
+float_after_invalid|0
+string_after_invalid|""
+bool_after_invalid|false
+done
