@@ -6,7 +6,6 @@ import {
     BrsString,
     BrsType,
     Double,
-    FlexObject,
     Float,
     Int32,
     Int64,
@@ -688,6 +687,13 @@ export class Field {
             value = BrsBoolean.from(value.getValue().toLowerCase() === "true");
         } else if (isBrsBoolean(value) && this.type === FieldKind.BoolArray) {
             value = new RoArray([value]);
+        } else if (
+            value instanceof RoArray &&
+            (this.type === FieldKind.FloatArray ||
+                this.type === FieldKind.IntArray ||
+                this.type === FieldKind.TimeArray)
+        ) {
+            value = this.convertNumericArray(value);
         } else if (this.type === FieldKind.Rect2D) {
             value = this.convertRect2D(value);
         } else if (this.type === FieldKind.Vector2D) {
@@ -730,8 +736,28 @@ export class Field {
         return newValue;
     }
 
+    // Coerce each element of an array-typed field to the device element type: FloatArray -> Float,
+    // TimeArray -> Double, IntArray -> Int32 (ColorArray is normalized by convertColorArray). Without this an integer-valued input array (e.g.
+    // itemSpacings = [12, 6, -16]) keeps Int32 elements, diverging from the device where the elements
+    // read back as Float. Non-numeric elements are left untouched.
+    private convertNumericArray(value: RoArray): RoArray {
+        const elements = value.elements.map((el: any) => {
+            if (!isAnyNumber(el)) {
+                return el;
+            }
+            const raw = Number((isBoxedNumber(el) ? el.unbox() : el).getValue());
+            if (this.type === FieldKind.FloatArray) {
+                return new Float(raw).box();
+            } else if (this.type === FieldKind.TimeArray) {
+                return new Double(raw).box();
+            }
+            return new Int32(raw).box();
+        });
+        return new RoArray(elements);
+    }
+
     private convertRect2D(value: BrsType): RoAssociativeArray {
-        const rectObject: FlexObject = { x: 0, y: 0, width: 0, height: 0 };
+        const rectObject: { x: number; y: number; width: number; height: number } = { x: 0, y: 0, width: 0, height: 0 };
         if (value instanceof RoArray) {
             const rectArray = jsValueOf(value);
             if (
@@ -758,14 +784,24 @@ export class Field {
                 rectObject.height = rectValue.height;
             }
         }
-        return toAssociativeArray(rectObject);
+        // The device always stores rect2d components as Float (like vector2d), regardless of
+        // whether the source values were integers. Box them explicitly so reads round-trip as
+        // Float rather than Int32 (which toAssociativeArray would infer from integer-valued numbers).
+        return new RoAssociativeArray([
+            { name: new BrsString("x"), value: new Float(rectObject.x) },
+            { name: new BrsString("y"), value: new Float(rectObject.y) },
+            { name: new BrsString("width"), value: new Float(rectObject.width) },
+            { name: new BrsString("height"), value: new Float(rectObject.height) },
+        ]);
     }
 
     private convertVector2D(value: BrsType): RoArray {
         const vectorArray: number[] = [];
         if (value instanceof RoArray) {
             if (value.elements.length === 2 && value.elements.every((item: any) => isAnyNumber(item))) {
-                return value;
+                // The device always stores vector2d components as Float. Re-box the elements so an
+                // integer-valued input (e.g. [80, 0]) round-trips as Float rather than Int32.
+                return new RoArray(value.elements.map((item: any) => new Float((item as BrsNumber).getValue()).box()));
             }
         } else if (value instanceof RoAssociativeArray) {
             const vecValue = fromAssociativeArray(value);
