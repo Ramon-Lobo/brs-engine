@@ -1,4 +1,4 @@
-import { AAMember, Interpreter, BrsBoolean, BrsType, Float, IfDraw2D, MeasuredText, Rect } from "brs-engine";
+import { AAMember, Interpreter, BrsBoolean, BrsString, BrsType, Float, IfDraw2D, MeasuredText, Rect } from "brs-engine";
 import { Group } from "./Group";
 import { FieldKind, FieldModel } from "../SGTypes";
 import { SGNodeType } from ".";
@@ -22,6 +22,7 @@ export class Label extends Group {
         { name: "wordBreakChars", type: "string" },
         { name: "ellipsisText", type: "string" },
         { name: "isTextEllipsized", type: "boolean", value: "false" },
+        { name: "forceUpperCase", type: "boolean", value: "false" },
     ];
     protected measured?: MeasuredText;
 
@@ -40,6 +41,16 @@ export class Label extends Group {
 
     setValue(index: string, value: BrsType, alwaysNotify?: boolean, kind?: FieldKind) {
         const fieldName = index.toLowerCase();
+        // brighttest local-only patch (BRS-02): `forceUpperCase` is NOT a field of a real Roku Label. It exists
+        // here as a non-device convenience and stores the uppercased text. Never offered upstream.
+        if (fieldName === "text" && this.getValueJS("forceUpperCase") === true && value instanceof BrsString) {
+            value = new BrsString(value.getValue().toUpperCase());
+        } else if (fieldName === "forceuppercase" && value instanceof BrsBoolean && value.toBoolean()) {
+            const current = this.getValueJS("text");
+            if (typeof current === "string") {
+                super.setValue("text", new BrsString(current.toUpperCase()));
+            }
+        }
         const resetFields = ["text", "font", "width", "height", "numlines", "maxlines", "wrap", "linespacing"];
         let setDirty = true;
         if (!this.isDirty && fieldName === "text" && this.getValueJS("text") === value.toString()) {
