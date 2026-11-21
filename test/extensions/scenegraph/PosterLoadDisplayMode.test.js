@@ -20,4 +20,23 @@ describe("Poster.loadDisplayMode is normalized to lowercase", () => {
         poster.setValue("loadDisplayMode", new BrsString(assigned));
         expect(poster.getValueJS("loadDisplayMode")).toBe(expected);
     });
+
+    test("the field name is matched case-insensitively", () => {
+        const poster = SGNodeFactory.createNode("Poster");
+        poster.setValue("loaddisplaymode", new BrsString("ScaleToFit"));
+        expect(poster.getValueJS("loadDisplayMode")).toBe("scaletofit");
+    });
+
+    test("the mode can be changed again after normalization", () => {
+        const poster = SGNodeFactory.createNode("Poster");
+        poster.setValue("loadDisplayMode", new BrsString("ScaleToFit"));
+        poster.setValue("loadDisplayMode", new BrsString("NoScale"));
+        expect(poster.getValueJS("loadDisplayMode")).toBe("noscale");
+    });
+
+    test("other Poster string fields are not lowercased", () => {
+        const poster = SGNodeFactory.createNode("Poster");
+        poster.setValue("uri", new BrsString("pkg:/Images/Hero.PNG"));
+        expect(poster.getValueJS("uri")).toBe("pkg:/Images/Hero.PNG");
+    });
 });
