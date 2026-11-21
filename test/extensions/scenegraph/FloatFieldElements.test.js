@@ -2,7 +2,7 @@ const scenegraph = require("../../../packages/scenegraph/lib/brs-sg.node.js");
 const core = require("../../../packages/node/bin/brs.node.js");
 
 const { SGNodeFactory } = scenegraph;
-const { BrsString, Int32, RoArray, RoAssociativeArray, ValueKind } = core;
+const { BrsString, Int32, Double, RoArray, RoAssociativeArray, ValueKind } = core;
 
 /**
  * On a device the components of rect2d and vector2d fields (translation included) and the
@@ -64,5 +64,39 @@ describe("rect2d, vector2d and floatarray elements are stored as Float", () => {
         const stored = nodeWith("ca", "colorarray", colors).getValue("ca").elements;
         expect(stored.map(kindOf)).toEqual([ValueKind.Int32, ValueKind.Int32]);
         expect(stored[0].unbox().getValue()).toBe(0x0d1117ff | 0);
+    });
+
+    test("rect2d assigned from an associative array reads back as Float components", () => {
+        const aa = new RoAssociativeArray([
+            { name: new BrsString("x"), value: new Int32(5) },
+            { name: new BrsString("y"), value: new Int32(6) },
+            { name: new BrsString("width"), value: new Int32(7) },
+            { name: new BrsString("height"), value: new Int32(8) },
+        ]);
+        const node = nodeWith("r", "rect2d", aa);
+        const rect = node.getValue("r");
+        for (const key of ["x", "y", "width", "height"]) {
+            expect(kindOf(rect.get(new BrsString(key)))).toBe(ValueKind.Float);
+        }
+        expect(node.getValueJS("r")).toEqual({ x: 5, y: 6, width: 7, height: 8 });
+    });
+
+    test("fractional values are preserved when re-boxed as Float", () => {
+        const doubles = new RoArray([new Double(1.5), new Double(-2.25)]);
+        const node = nodeWith("fa", "floatarray", doubles);
+        expect(node.getValue("fa").elements.map(kindOf)).toEqual([ValueKind.Float, ValueKind.Float]);
+        expect(node.getValueJS("fa")).toEqual([1.5, -2.25]);
+    });
+
+    test("an empty floatarray stays empty", () => {
+        const node = nodeWith("fa", "floatarray", new RoArray([]));
+        expect(node.getValue("fa").elements).toHaveLength(0);
+    });
+
+    test("non-numeric elements of a floatarray are left untouched", () => {
+        const node = nodeWith("fa", "floatarray", new RoArray([new Int32(1), new BrsString("x")]));
+        const elements = node.getValue("fa").elements;
+        expect(kindOf(elements[0])).toBe(ValueKind.Float);
+        expect(kindOf(elements[1])).toBe(ValueKind.String);
     });
 });
