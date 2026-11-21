@@ -1,0 +1,71 @@
+name: bt-rebase-check
+
+# Dry-run check that the brighttest patch queue still applies onto an upstream ref.
+# Manual only. The weekly cron is deliberately not enabled (owner step).
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: Upstream ref (tag or branch) to apply the queue onto
+        required: true
+        default: v2.7.1
+      base_tag:
+        description: Upstream tag the queue was built on (queue = base_tag..queue_ref)
+        required: true
+        default: v2.7.0
+      queue_ref:
+        description: Branch or ref holding the patch queue in this repo
+        required: true
+        default: bt/2.7.0
+
+permissions:
+  contents: read
+
+jobs:
+  rebase-check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Apply patch queue onto upstream ref
+        env:
+          UPSTREAM_URL: https://github.com/lvcabral/brs-engine.git
+          UPSTREAM_REF: ${{ inputs.upstream_ref }}
+          BASE_TAG: ${{ inputs.base_tag }}
+          QUEUE_REF: ${{ inputs.queue_ref }}
+          FORK_URL: ${{ github.server_url }}/${{ github.repository }}.git
+        run: |
+          set -euo pipefail
+          git config --global user.name "bt-rebase-check"
+          git config --global user.email "bt-rebase-check@localhost"
+          WORK="${RUNNER_TEMP:-$(mktemp -d)}/bt-rebase-check"
+          rm -rf "$WORK"
+          if [ -n "${LOCAL_REPO:-}" ]; then
+            git clone --quiet --no-checkout "$LOCAL_REPO" "$WORK"
+          else
+            git clone --quiet --no-checkout "$FORK_URL" "$WORK"
+          fi
+          cd "$WORK"
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || true
+          timeout 300 git fetch --quiet --tags upstream "$UPSTREAM_REF" || timeout 300 git fetch --quiet upstream "refs/tags/$UPSTREAM_REF:refs/tags/$UPSTREAM_REF"
+          git rev-parse --verify --quiet "refs/tags/$BASE_TAG^{commit}" >/dev/null \
+            || { echo "::error::base tag $BASE_TAG not found"; exit 1; }
+          QUEUE_SHA=$(git rev-parse --verify --quiet "origin/$QUEUE_REF^{commit}" || git rev-parse --verify --quiet "$QUEUE_REF^{commit}") \
+            || { echo "::error::queue ref $QUEUE_REF not found"; exit 1; }
+          TARGET=$(git rev-parse --verify "FETCH_HEAD^{commit}")
+          echo "queue: $BASE_TAG..$QUEUE_REF ($QUEUE_SHA) -> $UPSTREAM_REF ($TARGET)"
+          git checkout --quiet --detach "$TARGET"
+          COUNT=0
+          for C in $(git rev-list --reverse --no-merges "refs/tags/$BASE_TAG..$QUEUE_SHA"); do
+            COUNT=$((COUNT + 1))
+            SUBJ=$(git log -1 --format=%s "$C")
+            if ! git format-patch -1 --stdout "$C" | git am --3way --quiet; then
+              echo "::error::patch $COUNT does not apply onto $UPSTREAM_REF: $(git rev-parse --short "$C") $SUBJ"
+              git am --show-current-patch=diff 2>/dev/null | head -n 40 || true
+              git diff --name-only --diff-filter=U || true
+              git am --abort || true
+              exit 1
+            fi
+            echo "applied $COUNT: $(git rev-parse --short "$C") $SUBJ"
+          done
+          [ "$COUNT" -gt 0 ] || { echo "::error::queue $BASE_TAG..$QUEUE_REF is empty"; exit 1; }
+          echo "applies cleanly: $COUNT patches onto $UPSTREAM_REF"
