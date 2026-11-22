@@ -130,6 +130,8 @@ function main() {
     if (!args.skipBuild) {
         run("npm", ["run", "clean", "-w", STOCK_NAME], { stdio: "inherit" });
         run("npm", ["run", "release", "-w", STOCK_NAME], { stdio: "inherit" });
+        // the SceneGraph build type-checks against the browser API package (gitignored lib/ and types/), so build it first
+        run("npm", ["run", "release", "-w", "brs-engine"], { stdio: "inherit" });
         run("npm", ["run", "build:sg", "-w", STOCK_NAME], { stdio: "inherit" });
     }
 
