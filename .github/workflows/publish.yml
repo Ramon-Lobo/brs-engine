@@ -27,7 +27,8 @@ name: Stage release
 # right after a green stage, BEFORE the owner approves. A rejected stage would leave that tag behind and force the next
 # build number, so the owner should normally tag by hand after approving the staged package.
 #
-# Mirrors the stage-only release pipeline PR in the main repository (#372) as of 69e525b; rebase after it merges.
+# Mirrors release.yml of the stage-only release pipeline merged in the main repository (#372; its body is identical to
+# 69e525b). Differences are dispatch-specific: bt/<upstream> branch, upstream-tag ancestry, opt-in tag job.
 on:
   workflow_dispatch:
     inputs:
@@ -229,6 +230,12 @@ jobs:
             echo "::error::Tarball integrity differs from the one verify built ($ACTUAL vs $EXPECTED)."
             exit 1
           fi
+          # Runs no repository code: only reads package.json out of the tarball with tar.
+          PKG_NAME=$(tar -xOzf "$PKG_DIR/$TARBALL" package/package.json | node -p 'const p=JSON.parse(require("fs").readFileSync(0,"utf8"));p.name+" "+p.version')
+          if [ "$PKG_NAME" != "@ramonlobo/brs-node ${VERSION}" ]; then
+            echo "::error::Tarball contains '$PKG_NAME', expected '@ramonlobo/brs-node ${VERSION}'."
+            exit 1
+          fi
       - name: Stage the package (not live until approved)
         env:
           # The only place the token is exposed. Stage-only scope: a leak can stage, never go live.
@@ -273,10 +280,13 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          persist-credentials: false # the token is passed to the push only, not left in .git/config
       - name: Create the tag (never moved)
         env:
           VERSION: ${{ needs.verify.outputs.version }}
           SHA: ${{ github.sha }}
+          GH_TOKEN: ${{ github.token }}
+          REPO_URL: ${{ github.server_url }}/${{ github.repository }}.git
         run: |
           set -euo pipefail
           TAG="v${VERSION}"
@@ -284,9 +294,11 @@ jobs:
             v*-bt.*) ;;
             *) echo "::error::Refusing to tag $TAG"; exit 1 ;;
           esac
-          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
+          AUTH="AUTHORIZATION: basic $(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')"
+          echo "::add-mask::${AUTH#AUTHORIZATION: basic }"
+          if git -c "http.extraheader=$AUTH" ls-remote --exit-code --tags "$REPO_URL" "refs/tags/$TAG" > /dev/null 2>&1; then
             echo "::error::Tag $TAG already exists; it is never moved."
             exit 1
           fi
           git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" tag -a "$TAG" "$SHA" -m "$TAG"
-          git push origin "refs/tags/$TAG"
+          git -c "http.extraheader=$AUTH" push "$REPO_URL" "refs/tags/$TAG"
