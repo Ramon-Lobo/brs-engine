@@ -921,6 +921,9 @@ function handleStringMessage(message: string) {
     }
 }
 
+/** Lines longer than this are written without colorizing (avoids quadratic regex cost). */
+const COLORIZE_MAX = 8192;
+
 /**
  * Applies color formatting to console messages using chalk.
  * Highlights keywords, numbers, emails, URLs, and quoted strings with different colors.
@@ -928,25 +931,50 @@ function handleStringMessage(message: string) {
  * @returns The colorized string with ANSI color codes
  */
 function colorize(log: string) {
-    return log
+    if (log.length > COLORIZE_MAX) {
+        return log;
+    }
+    let out = log
         .replaceAll(/\b(down|error|errors|failure|fail|fatal|false)(:|\b)/gi, chalk.red("$1$2"))
         .replaceAll(/\b(warning|warn|test|null|undefined|invalid)(:|\b)/gi, chalk.yellow("$1$2"))
         .replaceAll(/\b(help|hint|info|information|true|log)(:|\b)/gi, chalk.cyan("$1$2"))
         .replaceAll(/\b(running|success|successfully|valid)(:|\b)/gi, chalk.green("$1$2"))
         .replaceAll(/\b(debug|roku|brs|brightscript)(:|\b)/gi, chalk.magenta("$1$2"))
-        .replaceAll(/(\b\d+\.?\d*?\b)/g, chalk.ansi256(122)(`$1`)) // Numeric
-        .replaceAll(/\S+@\S+\.\S+/g, (match: string) => {
-            return chalk.blueBright(stripAnsi(match)); // E-Mail
-        })
-        .replaceAll(/\b([a-z]+):\/{1,2}[^\/].*/gi, (match: string) => {
+        .replaceAll(/(\b\d+\.?\d*?\b)/g, chalk.ansi256(122)(`$1`)); // Numeric
+    if (log.includes("@")) {
+        out = colorizeEmails(out);
+    }
+    if (log.includes(":/")) {
+        out = out.replaceAll(/\b([a-z]+):\/{1,2}[^\/].*/gi, (match: string) => {
             return chalk.blue.underline(stripAnsi(match)); // URL
-        })
-        .replaceAll(/<(.*?)>/g, (match: string) => {
-            return chalk.greenBright(stripAnsi(match)); // Delimiters < >
-        })
-        .replaceAll(/"(.*?)"/g, (match: string) => {
+        });
+    }
+    out = out.replaceAll(/<(.*?)>/g, (match: string) => {
+        return chalk.greenBright(stripAnsi(match)); // Delimiters < >
+    });
+    if (log.includes('"')) {
+        out = out.replaceAll(/"(.*?)"/g, (match: string) => {
             return chalk.ansi256(222)(stripAnsi(match)); // Quotes
         });
+    }
+    return out;
+}
+
+/**
+ * Linear-time equivalent of `replaceAll(/\S+@\S+\.\S+/g, ...)`: a whitespace-free token is an
+ * e-mail match when it has an "@" at index >= 1 followed, at least two characters later, by a "."
+ * that is not the last character.
+ * @param text - The text to scan
+ * @returns The text with e-mail tokens highlighted
+ */
+function colorizeEmails(text: string) {
+    return text.replaceAll(/\S+/g, (tok: string) => {
+        const at = tok.indexOf("@", 1);
+        if (at !== -1 && tok.lastIndexOf(".", tok.length - 2) >= at + 2) {
+            return chalk.blueBright(stripAnsi(tok)); // E-Mail
+        }
+        return tok;
+    });
 }
 
 /**
