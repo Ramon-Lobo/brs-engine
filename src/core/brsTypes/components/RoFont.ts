@@ -4,6 +4,7 @@ import { BrsType } from "..";
 import { Callable, StdlibArgument } from "../Callable";
 import { Interpreter } from "../../interpreter";
 import { Int32 } from "../Int32";
+import { BrsDevice } from "../../device/BrsDevice";
 import { FontMetrics, getFontRegistry } from "./RoFontRegistry";
 import { BrsCanvas, BrsCanvasContext2D, MeasuredText } from "../interfaces/IfDraw2D";
 
@@ -107,6 +108,10 @@ export class RoFont extends BrsComponent implements BrsValue {
         }
 
         const measured = { width: Math.round(length), text: ellipsizedText, ellipsized };
+        if (BrsDevice.isExitRequested()) {
+            // The measuring canvas answers 0 after an exit request: that is not a real measure
+            return measured;
+        }
         if (this.measureCache.size >= MeasureCacheLimit) {
             this.measureCache.clear();
         }

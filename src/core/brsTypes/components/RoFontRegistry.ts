@@ -12,7 +12,7 @@ import * as opentype from "@lvcabral/opentype.js";
 import { FontFace as NodeFontFace, fonts as nodeFonts } from "canvas";
 /// #endif
 import { BrsDevice } from "../../device/BrsDevice";
-import { BrsCanvas, createNewCanvas, releaseCanvas } from "../interfaces/IfDraw2D";
+import { BrsCanvas, BrsCanvasContext2D, createNewCanvas, releaseCanvas } from "../interfaces/IfDraw2D";
 import { nextAddress, setFontTextureProvider } from "../../device/Graphics";
 import { GraphicsBitmap } from "../../common";
 
@@ -79,12 +79,34 @@ export class RoFontRegistry extends BrsComponent implements BrsValue {
 
         // Create a canvas for measuring text
         this.canvas = createNewCanvas(10, 10);
+        this.guardMeasureText(this.canvas);
 
         // Expose the registered fonts to the texture-memory debug data (r2d2-bitmaps).
         // Only in debug mode — production mode keeps the texture registry empty.
         if (BrsDevice.tracking) {
             setFontTextureProvider(this.getFontTextures.bind(this));
         }
+    }
+
+    /**
+     * Makes the measuring canvas stop working once the host has asked the app to exit.
+     *
+     * Measuring a long text is one native call per probe, and ellipsizing probes it over and over, so a
+     * single statement can keep the render thread inside node-canvas for minutes. If the host's forced
+     * stop (`worker.terminate()`) lands in one of those calls, the whole process aborts with
+     * `FATAL ERROR: Error::ThrowAsJavaScriptException napi_throw`, which nothing can catch. Returning a
+     * zero width after an exit request ends those loops at once, so the thread reaches its next
+     * statement, unwinds on the EXIT command and exits on its own before the force-stop fires.
+     * @param canvas Canvas used for measuring
+     */
+    private guardMeasureText(canvas: BrsCanvas) {
+        const ctx = canvas.getContext("2d", { alpha: false }) as BrsCanvasContext2D | null;
+        if (!ctx) {
+            return;
+        }
+        const measure = ctx.measureText.bind(ctx);
+        ctx.measureText = (text: string) =>
+            BrsDevice.isExitRequested() ? ({ width: 0 } as TextMetrics) : measure(text);
     }
 
     /**

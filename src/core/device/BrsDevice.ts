@@ -505,6 +505,20 @@ export class BrsDevice {
     }
 
     /**
+     * Tells whether the host asked this app to exit (the EXIT debug command is set in the shared array).
+     * Read-only: unlike `checkBreakCommand` it never consumes the command, so it is safe to call from
+     * inside a single long statement. Long native canvas loops poll it to stop early: the host
+     * force-terminates the thread a grace period after asking, and a `worker.terminate()` that lands
+     * inside a node-canvas call aborts the whole process (see `src/node/workerLoad.ts`).
+     * @returns True when an exit was requested
+     */
+    static isExitRequested(): boolean {
+        return (
+            this.sharedArray.length > DataType.DBG && Atomics.load(this.sharedArray, DataType.DBG) === DebugCommand.EXIT
+        );
+    }
+
+    /**
      * Checks if the Break/Pause Command or Debug Thread is set in the shared array.
      * Handles debug pause and continue states.
      * @param debugSession Whether debug session is active
