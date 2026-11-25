@@ -82,11 +82,24 @@ export class RoFont extends BrsComponent implements BrsValue {
         if (ellipsis && maxWidth && measuredWidth > maxWidth) {
             // Ellipsize the text
             let ellipsisWidth = ctx.measureText(ellipsis).width;
-            let truncatedText = text;
 
-            while (truncatedText.length > 0 && ctx.measureText(truncatedText).width + ellipsisWidth > maxWidth) {
-                truncatedText = truncatedText.slice(0, -1);
+            // Find the longest prefix that still fits with the ellipsis, in O(log n) measurements.
+            // Dropping one character at a time and re-measuring the remainder is quadratic: a very
+            // long text in a narrow Label held the render thread for minutes. The result is identical
+            // whenever a prefix's width only grows with its length (true for Latin text, kerning
+            // included). Where it does not (emoji sequences, combining marks, right-to-left text) the
+            // cut may be shorter than a linear scan would give, but never wider than maxWidth.
+            let fit = 0;
+            let over = text.length; // the full text is known not to fit
+            while (fit + 1 < over) {
+                const mid = (fit + over) >> 1;
+                if (ctx.measureText(text.slice(0, mid)).width + ellipsisWidth > maxWidth) {
+                    over = mid;
+                } else {
+                    fit = mid;
+                }
             }
+            const truncatedText = text.slice(0, fit);
 
             ellipsizedText = truncatedText + ellipsis;
             length = ctx.measureText(ellipsizedText).width;
