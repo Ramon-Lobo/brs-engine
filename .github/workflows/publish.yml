@@ -1,0 +1,270 @@
+name: Stage release
+
+# Stage-only npm release of @ramonlobo/brs-node (the only package this fork publishes, from packages/node).
+# Manual trigger only: no tag push, no schedule. The version is stamped at stage time as <upstream>-bt.<N> by
+# scripts/bt-pack.js; any version without "-bt." is refused. Staged under the dist-tag `next`, never `latest`.
+#
+# `verify` runs the gates and builds the tarball (build order: brs-engine core, brs-node, brs-scenegraph; the SceneGraph
+# build needs the node bundle directory). `stage` runs NO repository code: it downloads that tarball, checks its sha512 integrity and stages exactly
+# that file with `npm stage publish`. The credential is the environment secret NPM_TOKEN, a granular token limited to
+# "Read and Write (Stage only)". Nothing is live until the owner approves the staged version on npmjs.com or with
+# `npm stage approve <stage-id>`. This file must never call `npm publish`.
+#
+# The `tag` job (v<upstream>-bt.<N>) is opt-in (create_tag), runs only after a green stage, and never moves an
+# existing tag. It is written here for the owner to run after approving the staged package.
+#
+# Drafted to match the final design of the stage-only release pipeline PR (head d96f522); a rebase onto the merged
+# version of that PR is pending.
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: "bt build number N (positive integer): stamps <upstream>-bt.N"
+        type: string
+        required: true
+      create_tag:
+        description: "After a green stage, create the tag v<upstream>-bt.N (never moves an existing tag)"
+        type: boolean
+        default: false
+
+permissions: {}
+
+concurrency:
+  group: stage-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    outputs:
+      integrity: ${{ steps.pack.outputs.integrity }}
+      tarball: ${{ steps.pack.outputs.tarball }}
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # full history and tags: bt-pack reads the queue's commit trailers from v<upstream>..HEAD
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+      - name: Check branch, build number and version
+        id: check
+        env:
+          BUILD: ${{ inputs.build }}
+          REF_NAME: ${{ github.ref_name }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          case "$REF_NAME" in
+            bt/*|master) ;;
+            *) echo "::error::Run this workflow from a bt/* branch (or master), not $REF_NAME."; exit 1 ;;
+          esac
+          git fetch --no-tags origin "$REF_NAME:refs/remotes/origin/$REF_NAME"
+          if ! git merge-base --is-ancestor "$SHA" "origin/$REF_NAME"; then
+            echo "::error::Commit $SHA is not an ancestor of origin/$REF_NAME."
+            exit 1
+          fi
+          if ! printf '%s' "$BUILD" | grep -Eq '^[1-9][0-9]*$'; then
+            echo "::error::build must be a positive integer, got '$BUILD'."
+            exit 1
+          fi
+          UPSTREAM=$(node -p "require('./packages/node/package.json').version")
+          case "$UPSTREAM" in
+            *-*) echo "::error::Source version $UPSTREAM already has a suffix; expected a plain upstream version."; exit 1 ;;
+          esac
+          VERSION="${UPSTREAM}-bt.${BUILD}"
+          case "$VERSION" in
+            *-bt.*) ;;
+            *) echo "::error::Refusing a version without -bt.: $VERSION"; exit 1 ;;
+          esac
+          git rev-parse --verify --quiet "refs/tags/v${UPSTREAM}" > /dev/null || { echo "::error::Upstream tag v${UPSTREAM} is not in this repository."; exit 1; }
+          if git rev-parse --verify --quiet "refs/tags/v${VERSION}" > /dev/null; then
+            echo "::error::Tag v${VERSION} already exists; versions are never reused."
+            exit 1
+          fi
+          # Fail closed: only a registry 404 means "not published". Any other error stops the run.
+          set +e
+          VIEW=$(npm view "@ramonlobo/brs-node@$VERSION" version 2>&1)
+          VIEW_RC=$?
+          set -e
+          if [ "$VIEW_RC" -eq 0 ] && [ -n "$VIEW" ]; then
+            echo "::error::@ramonlobo/brs-node@$VERSION is already on npm. Bump the build number."
+            exit 1
+          elif ! printf '%s' "$VIEW" | grep -q 'E404'; then
+            echo "::error::Could not tell whether @ramonlobo/brs-node@$VERSION is on npm (not a 404): $VIEW"
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+      - run: npm ci
+      - name: Test (the suite runs against development builds; production bundles are minified and break snapshots)
+        run: |
+          set -euo pipefail
+          npm run build -w brs-engine
+          npm run build -w brs-node
+          npm run build -w brs-scenegraph
+          npm test
+      - name: Build for release in dependency order (core, node, then scenegraph)
+        run: |
+          set -euo pipefail
+          # The SceneGraph build type-checks against the core package and copies its bundle into packages/node/bin,
+          # so it runs after core and after the node bundle has created that directory.
+          npm run release -w brs-engine
+          npm run release -w brs-node
+          npm run release -w brs-scenegraph
+      - name: Pack the tarball (bt-pack stamps the version) and check it
+        id: pack
+        env:
+          BUILD: ${{ inputs.build }}
+          VERSION: ${{ steps.check.outputs.version }}
+          OUT: ${{ runner.temp }}/out
+        run: |
+          set -euo pipefail
+          mkdir -p "$OUT"
+          node scripts/bt-pack.js --build "$BUILD" --out "$OUT" --skip-build
+          TARBALL="ramonlobo-brs-node-${VERSION}.tgz"
+          test -f "$OUT/$TARBALL"
+          node -e '
+            const {execFileSync}=require("child_process");
+            const [file,version]=process.argv.slice(1);
+            const pkg=JSON.parse(execFileSync("tar",["-xOzf",file,"package/package.json"],{encoding:"utf8"}));
+            if(pkg.name!=="@ramonlobo/brs-node"||pkg.version!==version||!pkg.version.includes("-bt.")){
+              console.error("unexpected package in tarball:",pkg.name,pkg.version);process.exit(1);
+            }
+            if(!/Ramon-Lobo\/brs-engine/.test(JSON.stringify(pkg.repository))){
+              console.error("repository field does not point at the fork");process.exit(1);
+            }
+          ' "$OUT/$TARBALL" "$VERSION"
+          INTEGRITY=$(node -e 'const c=require("crypto"),fs=require("fs");process.stdout.write("sha512-"+c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$OUT/$TARBALL")
+          echo "integrity=$INTEGRITY" >> "$GITHUB_OUTPUT"
+          echo "tarball=$TARBALL" >> "$GITHUB_OUTPUT"
+      - name: Upload the tarball (the exact bytes that will be staged)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: tarball-${{ steps.check.outputs.version }}
+          path: ${{ runner.temp }}/out/${{ steps.pack.outputs.tarball }}
+          retention-days: 1
+          if-no-files-found: error
+
+  # Runs NO repository code: no checkout, no npm ci, no repo scripts. Downloads the tarball verify built, checks its
+  # sha512 integrity, and stages that exact file.
+  stage:
+    name: stage on npm
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: npm-release
+    permissions:
+      contents: read
+      id-token: write # GitHub OIDC for the npm trusted publisher
+    steps:
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - name: Ensure npm supports staged publishing (>= 11.15.0)
+        run: |
+          set -euo pipefail
+          echo "npm $(npm -v), node $(node -v)"
+          if ! node -e 'const [a,b]=process.argv[1].split(".").map(Number);process.exit(a>11||(a===11&&b>=15)?0:1)' "$(npm -v)"; then
+            # Pinned version, registry integrity compared with a constant before installing (npm has no install scripts).
+            WANT="sha512-5Cf+jE+XctbhH/zjOOqXC+ity7eec/Tkk4Ql38tf6w+1htp2wYPHmE4c1R1Es3DY227Ac14+SLrlYJwkBicbTg=="
+            [ "$(npm view npm@11.21.3 dist.integrity)" = "$WANT" ]
+            npm install -g npm@11.21.3
+            echo "npm now $(npm -v)"
+          fi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: tarball-${{ needs.verify.outputs.version }}
+          path: ${{ runner.temp }}/pkg
+      - name: Verify the tarball integrity and version
+        env:
+          EXPECTED: ${{ needs.verify.outputs.integrity }}
+          TARBALL: ${{ needs.verify.outputs.tarball }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          PKG_DIR: ${{ runner.temp }}/pkg
+        run: |
+          set -euo pipefail
+          case "$VERSION" in
+            *-bt.*) ;;
+            *) echo "::error::Refusing a version without -bt.: $VERSION"; exit 1 ;;
+          esac
+          if [ "$TARBALL" != "ramonlobo-brs-node-${VERSION}.tgz" ]; then
+            echo "::error::Unexpected tarball name $TARBALL for version $VERSION."
+            exit 1
+          fi
+          if [ -z "$EXPECTED" ]; then
+            echo "::error::verify did not report a tarball integrity."
+            exit 1
+          fi
+          ACTUAL=$(node -e 'const c=require("crypto"),fs=require("fs");process.stdout.write("sha512-"+c.createHash("sha512").update(fs.readFileSync(process.argv[1])).digest("base64"))' "$PKG_DIR/$TARBALL")
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "::error::Tarball integrity differs from the one verify built ($ACTUAL vs $EXPECTED)."
+            exit 1
+          fi
+      - name: Stage the package (not live until approved)
+        env:
+          # The only place the token is exposed. Stage-only scope: a leak can stage, never go live.
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ needs.verify.outputs.version }}
+          TARBALL: ${{ needs.verify.outputs.tarball }}
+          PKG_DIR: ${{ runner.temp }}/pkg
+        run: |
+          set -euo pipefail
+          # --tag next is hard-coded: a -bt.N build is never `latest`.
+          npm stage publish "$PKG_DIR/$TARBALL" --ignore-scripts --access public --tag next --provenance 2>&1 | tee "$RUNNER_TEMP/stage.log"
+          STAGE_ID=$(grep -Eo 'staged with id [A-Za-z0-9_-]+' "$RUNNER_TEMP/stage.log" | head -n1 | awk '{print $NF}' || true)
+          {
+            echo "## @ramonlobo/brs-node ${VERSION} is STAGED, not published"
+            echo
+            echo "Dist-tag when approved: \`next\`"
+            echo
+            if [ -n "$STAGE_ID" ]; then
+              echo "Stage id: \`${STAGE_ID}\`"
+            else
+              echo "Stage id: not found in the CLI output below. Find it on npmjs.com (Staged Packages tab)."
+            fi
+            echo
+            echo "Approve on npmjs.com (2FA) or with \`npm stage approve <stage-id>\`. Reject to discard."
+            echo
+            echo '```'
+            cat "$RUNNER_TEMP/stage.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # Opt-in, after a green stage. Creates v<upstream>-bt.<N> on the staged commit and never moves an existing tag.
+  tag:
+    name: tag
+    needs: [verify, stage]
+    if: inputs.create_tag
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # create the tag
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - name: Create the tag (never moved)
+        env:
+          VERSION: ${{ needs.verify.outputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          TAG="v${VERSION}"
+          case "$TAG" in
+            v*-bt.*) ;;
+            *) echo "::error::Refusing to tag $TAG"; exit 1 ;;
+          esac
+          if git ls-remote --exit-code --tags origin "refs/tags/$TAG" > /dev/null 2>&1; then
+            echo "::error::Tag $TAG already exists; it is never moved."
+            exit 1
+          fi
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" tag -a "$TAG" "$SHA" -m "$TAG"
+          git push origin "refs/tags/$TAG"

@@ -6,17 +6,17 @@
   "author": "Marcelo Lv Cabral <marcelo@lvcabral.com> (https://lvcabral.com/)",
   "license": "MIT",
   "copyright": "© 2019-2026, Marcelo Lv Cabral",
-  "homepage": "https://lvcabral.com/brs/",
+  "homepage": "https://github.com/Ramon-Lobo/brs-engine#readme",
   "contributors": [
     "Sean Barag <sean@barag.org>",
     "Mark Pearce"
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/lvcabral/brs-engine.git"
+    "url": "git+https://github.com/Ramon-Lobo/brs-engine.git"
   },
   "bugs": {
-    "url": "https://github.com/lvcabral/brs-engine/issues"
+    "url": "https://github.com/Ramon-Lobo/brs-engine/issues"
   },
   "keywords": [
     "brightscript",
