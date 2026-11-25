@@ -8,6 +8,7 @@
  *   - the SceneGraph bundle's webpack external `require("brs-node")` -> `require("@ramonlobo/brs-node")`
  *   - a `brighttest` stamp in package.json (patch ids and revisions, local-only "nonDevice" list)
  *   - BT-PATCHES.md generated from the queue's commit trailers (BT-Patch, Upstream, Device-verified, Non-device)
+ *   - a `flags` list in the stamp from the queue's BT-Flag trailers (brs-cli options brighttest can feature-detect)
  *
  * Usage: node scripts/bt-pack.js --build <N> [--base <tag>] [--out <dir>] [--skip-build]
  *   --build N     brighttest build number, produces <upstream>-bt.<N>   (required)
@@ -71,6 +72,13 @@ function readQueue(base) {
         .filter((c) => c.trailers["BT-Patch"]);
 }
 
+function splitList(text) {
+    return (text || "")
+        .split(",")
+        .map((f) => f.trim())
+        .filter(Boolean);
+}
+
 function patchRevision(sha) {
     // revision bumps when a patch's behavior changes; the queue starts every patch at 1
     return 1;
@@ -121,6 +129,8 @@ function main() {
         upstream: `${STOCK_NAME}@${upstreamVersion}`,
         queue: branch,
         build: `v${upstreamVersion}-bt.${args.build}`,
+        // brs-cli options brighttest can rely on (from BT-Flag trailers); it feature-detects against this list
+        flags: [...new Set(featurePatches.flatMap((c) => splitList(c.trailers["BT-Flag"])))],
         patches: Object.fromEntries(featurePatches.map((c) => [c.trailers["BT-Patch"], patchRevision(c.sha)])),
         nonDevice: featurePatches
             .filter((c) => /^yes$/i.test(c.trailers["Non-device"] || ""))
