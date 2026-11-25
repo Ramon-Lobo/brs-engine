@@ -59,6 +59,7 @@ Options:
   -r, --root <directory>    The root directory from which `pkg:` paths will be resolved.
   -x, --ext-vol <path>      Path to directory or zip file from which `ext1:` will be mounted.
   -k, --deep-link <params>  Parameters to be passed to the application. (format: key=value,...)
+      --device-data <json>  JSON object with a partial DeviceInfo (e.g. friendlyName, countryCode) merged over the CLI device data. Values are not type-checked.
   -y, --registry            Persist the simulated device registry (and channel credentials) on disk.
   -v, --version             output the version number
   -h, --help                output usage information

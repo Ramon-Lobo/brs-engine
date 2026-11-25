@@ -105,6 +105,10 @@ program
     .option("-r, --root <directory>", "The root directory from which `pkg:` paths will be resolved.")
     .option("-x, --ext-vol <path>", "Path to directory or zip file from which `ext1:` will be mounted.")
     .option("-k, --deep-link <params>", "Parameters to be passed to the application. (format: key=value,...)")
+    .option(
+        "--device-data <json>",
+        "JSON object with a partial DeviceInfo (e.g. friendlyName, countryCode) merged over the CLI device data. Values are not type-checked."
+    )
     .option("-y, --registry", "Persist the simulated device registry (and channel credentials) on disk.", false)
     .action(async (brsFiles, program) => {
         if (typeof program.image === "string" && !isNumber(program.image)) {
@@ -144,6 +148,10 @@ program
                 deviceData.channelCredentials = getChannelCredentials();
             }
             deviceData.appList = new Array<AppData>();
+            if (program.deviceData !== undefined && !applyDeviceDataOverride(program.deviceData)) {
+                process.exitCode = 1;
+                return;
+            }
         }
         if (program.sg) {
             await loadSceneGraphExtension();
@@ -269,6 +277,38 @@ async function loadSceneGraphExtension() {
     } catch (err: any) {
         console.error(chalk.red(`Error loading SceneGraph extension: ${err.message}`));
     }
+}
+
+/**
+ * Merges a partial DeviceInfo (JSON text from `--device-data`) over the CLI device data.
+ * `connectionInfo` is merged one level deep so a partial override keeps the detected gateway/dns.
+ * @param json - JSON object text
+ * @returns false (after printing the reason) when the text is not a JSON object
+ */
+function applyDeviceDataOverride(json: string): boolean {
+    let override: any;
+    try {
+        override = JSON.parse(json);
+    } catch (err: any) {
+        console.error(chalk.red(`Invalid --device-data JSON: ${err.message}`));
+        return false;
+    }
+    if (override === null || typeof override !== "object" || Array.isArray(override)) {
+        console.error(chalk.red("Invalid --device-data: expected a JSON object."));
+        return false;
+    }
+    const { connectionInfo, ...rest } = override;
+    // never copy prototype-tampering keys (declared here: module-level consts below the program setup are not yet initialised)
+    const unsafeKeys = ["__proto__", "constructor", "prototype"];
+    for (const key of Object.keys(rest)) {
+        if (!unsafeKeys.includes(key)) {
+            (deviceData as any)[key] = rest[key];
+        }
+    }
+    if (connectionInfo && typeof connectionInfo === "object") {
+        deviceData.connectionInfo = { ...deviceData.connectionInfo, ...connectionInfo };
+    }
+    return true;
 }
 
 /**
