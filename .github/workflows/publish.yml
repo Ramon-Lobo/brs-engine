@@ -10,11 +10,24 @@ name: Stage release
 # "Read and Write (Stage only)". Nothing is live until the owner approves the staged version on npmjs.com or with
 # `npm stage approve <stage-id>`. This file must never call `npm publish`.
 #
-# The `tag` job (v<upstream>-bt.<N>) is opt-in (create_tag), runs only after a green stage, and never moves an
-# existing tag. It is written here for the owner to run after approving the staged package.
+# THREAT MODEL. On a dispatch GitHub runs this file from the DISPATCHED branch, so anyone who can push a branch and
+# dispatch can run a modified copy that drops the checks in `verify`. The checks here (bt/<upstream> branch, upstream tag
+# is an ancestor of the commit, build number, version not on npm, tests, tarball contents) guard honest mistakes, not an
+# attacker. The real controls are (1) the npm-release environment's deployment-branch policy limited to bt/*, (2) a
+# ruleset on bt/* limiting who can push there, (3) the npm trusted publisher bound to publish.yml AND its environment
+# field set to npm-release (otherwise a copy of this file on another branch could mint an OIDC token), and (4) the
+# owner's 2FA approval of the staged package. The token and the trusted publisher can only stage, and the package
+# disallows bypass-2FA tokens, so this file must never call `npm publish`.
 #
-# Drafted to match the final design of the stage-only release pipeline PR (head d96f522); a rebase onto the merged
-# version of that PR is pending.
+# One-time owner settings: environment npm-release with the NPM_TOKEN secret and deployment branches limited to bt/*;
+# a ruleset on bt/*; the npm trusted publisher for @ramonlobo/brs-node (workflow publish.yml, environment npm-release);
+# the upstream tag v<upstream> mirrored in this fork (done for v2.7.1).
+#
+# The `tag` job (v<upstream>-bt.<N>) is opt-in (create_tag, default false) and never moves an existing tag. It runs
+# right after a green stage, BEFORE the owner approves. A rejected stage would leave that tag behind and force the next
+# build number, so the owner should normally tag by hand after approving the staged package.
+#
+# Mirrors the stage-only release pipeline PR in the main repository (#372) as of 69e525b; rebase after it merges.
 on:
   workflow_dispatch:
     inputs:
@@ -62,8 +75,8 @@ jobs:
         run: |
           set -euo pipefail
           case "$REF_NAME" in
-            bt/*|master) ;;
-            *) echo "::error::Run this workflow from a bt/* branch (or master), not $REF_NAME."; exit 1 ;;
+            bt/*) ;;
+            *) echo "::error::Run this workflow from a bt/* branch, not $REF_NAME."; exit 1 ;;
           esac
           git fetch --no-tags origin "$REF_NAME:refs/remotes/origin/$REF_NAME"
           if ! git merge-base --is-ancestor "$SHA" "origin/$REF_NAME"; then
@@ -75,6 +88,14 @@ jobs:
             exit 1
           fi
           UPSTREAM=$(node -p "require('./packages/node/package.json').version")
+          if [ "$REF_NAME" != "bt/${UPSTREAM}" ]; then
+            echo "::error::Branch $REF_NAME must be bt/${UPSTREAM} to match packages/node version ${UPSTREAM}."
+            exit 1
+          fi
+          if ! git merge-base --is-ancestor "v${UPSTREAM}" "$SHA"; then
+            echo "::error::Upstream tag v${UPSTREAM} is not an ancestor of $SHA; the queue must sit on it."
+            exit 1
+          fi
           case "$UPSTREAM" in
             *-*) echo "::error::Source version $UPSTREAM already has a suffix; expected a plain upstream version."; exit 1 ;;
           esac
@@ -238,7 +259,8 @@ jobs:
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # Opt-in, after a green stage. Creates v<upstream>-bt.<N> on the staged commit and never moves an existing tag.
+  # Opt-in (create_tag, default false). Runs right after a green stage, before approval; a rejected stage leaves the tag
+  # and forces the next build number. Never moves an existing tag. Normally tag by hand after approval.
   tag:
     name: tag
     needs: [verify, stage]
