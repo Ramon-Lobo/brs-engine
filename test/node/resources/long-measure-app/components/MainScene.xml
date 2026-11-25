@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8" ?>
+<component name="MainScene" extends="Scene">
+    <children>
+        <Label id="lbl" width="100" ellipsisText="..." />
+    </children>
+</component>
